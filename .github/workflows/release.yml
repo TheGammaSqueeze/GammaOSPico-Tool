@@ -22,10 +22,10 @@ jobs:
           - os: windows-latest
             asset: gammaos-pico-tool-windows-x86_64.exe
             bin: gammaos-pico-tool.exe
-          - os: macos-13
+          - os: macos-15-intel
             asset: gammaos-pico-tool-macos-x86_64
             bin: gammaos-pico-tool
-          - os: macos-14
+          - os: macos-15
             asset: gammaos-pico-tool-macos-arm64
             bin: gammaos-pico-tool
     steps:
