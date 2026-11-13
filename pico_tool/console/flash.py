@@ -177,7 +177,7 @@ def _where_things_stand(failed: str, results: Dict[str, str], running: Optional[
     good other copy is reported, not relied on."""
     other = _other(failed)
     recover = ("If the console does not start, install GammaOS Pico again with the flash package and "
-               "SP Flash Tool (see the wiki's Installing page).")
+               "SP Flash Tool v5 (see the wiki's Installing page).")
     if other == running and other not in results:
         return ("%s was not touched, so the console still starts from it as before. Try the update again."
                 % other)

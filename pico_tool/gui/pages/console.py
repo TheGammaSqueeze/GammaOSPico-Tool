@@ -83,10 +83,12 @@ class ConsolePage(Page):
         widgets.PillButton(L, ctx, "USB setup help", self.drivers, "ghost", icon="usb", small=True).pack(anchor="w", pady=(S(10), 0))
         first = widgets.Notice(L, ctx, "note", "Installing for the first time?",
                                "A console with its stock bootloader has no fastboot this tool can use. The first "
-                               "time, GammaOS Pico goes on with SP Flash Tool from the flash package: open "
-                               "spflash/gammaos/ in it, choose Download Only with only lk_a and lk_b ticked, then "
-                               "connect the powered-off console. The Installing page shows every step. From then "
-                               "on, this tab backs the bootloader up, updates it and puts the stock one back.")
+                               "time, GammaOS Pico goes on with SP Flash Tool v5 (V6 does not work), which the "
+                               "release has with MediaTek's USB driver in gammaos-pico-kpa-windows-tools.zip: load "
+                               "MT6785_Android_scatter.txt from the flash package's spflash/gammaos/, choose "
+                               "Download Only with only lk_a and lk_b ticked, then connect the powered-off "
+                               "console. The Installing page shows every step. From then on, this tab backs the "
+                               "bootloader up, updates it and puts the stock one back.")
         first.pack(fill="x", pady=(S(18), 0))
         links = tk.Frame(first.body.master, bg=p.note_wash)
         links.pack(fill="x", pady=(S(8), 0))

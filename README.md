@@ -98,8 +98,9 @@ connect USB), the tool:
 Every write asks first, is checked against the image and read back afterwards.
 
 > [!NOTE]
-> The **first** install on a console with its stock bootloader is done with SP Flash Tool from the
-> flash package (`gammaos-pico-kpa-<version>-flash.zip`), as the wiki's
+> The **first** install on a console with its stock bootloader is done with SP Flash Tool v5 (the
+> release's `gammaos-pico-kpa-windows-tools.zip` has it, with MediaTek's USB driver) and the flash
+> package (`gammaos-pico-kpa-<version>-flash.zip`), as the wiki's
 > [Installing](https://github.com/TheGammaSqueeze/GammaOSPico/wiki/Installing) page shows step by
 > step. The Console tab explains it and can save the flash package for you; from then on, the tool
 > takes over.
