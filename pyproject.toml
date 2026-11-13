@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gammaos-pico-tool"
+version = "1.0.0"
+description = "Set up GammaOS Pico microSD cards, manage their box art, and back up or update the Konkr Pocket Advance's bootloader (window and command line)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "TheGammaSqueeze" }]
+keywords = ["gammaos", "pico", "konkr", "retro", "handheld", "boxart", "sdcard", "fastboot"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: X11 Applications",
+]
+dependencies = [
+    "pillow>=9",
+    "pyusb>=1.2.1",
+    "libusb-package>=1.0.26.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Wiki = "https://github.com/TheGammaSqueeze/GammaOSPico/wiki"
+Releases = "https://github.com/TheGammaSqueeze/GammaOSPico/releases"
+
+[project.scripts]
+gammaos-pico-tool = "pico_tool.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["pico_tool*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

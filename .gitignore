@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+out/
+*.spec
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# ScreenScraper developer credentials (never commit)
+devcreds.local.txt
+pico_tool/scrape/_devcreds_gen.py

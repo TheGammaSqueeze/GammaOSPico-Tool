@@ -1,0 +1,106 @@
+name: Build and release binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: gammaos-pico-tool-linux-x86_64
+            bin: gammaos-pico-tool
+          - os: windows-latest
+            asset: gammaos-pico-tool-windows-x86_64.exe
+            bin: gammaos-pico-tool.exe
+          - os: macos-13
+            asset: gammaos-pico-tool-macos-x86_64
+            bin: gammaos-pico-tool
+          - os: macos-14
+            asset: gammaos-pico-tool-macos-arm64
+            bin: gammaos-pico-tool
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip pyinstaller pytest
+          python -m pip install .
+
+      - name: Tests
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb p7zip-full zip
+          xvfb-run -a python -m pytest -q
+
+      - name: Bake in built-in ScreenScraper credentials
+        shell: bash
+        env:
+          SS_DEVCREDS_GEN: ${{ secrets.SS_DEVCREDS_GEN }}
+        run: |
+          if [ -n "$SS_DEVCREDS_GEN" ]; then
+            python -c "import base64,os; open('pico_tool/scrape/_devcreds_gen.py','wb').write(base64.b64decode(os.environ['SS_DEVCREDS_GEN']))"
+            echo "baked built-in ScreenScraper credentials into the build"
+          else
+            echo "no SS_DEVCREDS_GEN secret; building without built-in credentials (TheGamesDB with a user key still works)"
+          fi
+
+      - name: Build one-file binary
+        shell: bash
+        run: >
+          pyinstaller --onefile --name gammaos-pico-tool --clean --noconfirm
+          --paths .
+          --hidden-import tkinter
+          --hidden-import PIL --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder
+          --hidden-import usb.backend.libusb1
+          --hidden-import libusb_package
+          --hidden-import importlib_resources
+          --collect-binaries libusb_package
+          --collect-submodules pico_tool
+          packaging/entry.py
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "dist/${{ matrix.bin }}" "out/${{ matrix.asset }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+
+      - name: Ensure release exists
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Create the release from the tag if it does not exist yet, so a bare
+        # `git push origin vX.Y.Z` works without a separate `gh release create`.
+        # The `|| true` swallows the race where a sibling matrix job creates it
+        # in the same instant.
+        run: |
+          gh release view "${GITHUB_REF_NAME}" \
+            || gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes \
+            || true
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "out/${{ matrix.asset }}" --clobber
