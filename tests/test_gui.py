@@ -3,6 +3,7 @@ set up from a package, the games listed and covers set, the console backed up an
 stand-in for the console part."""
 
 import time
+import unicodedata
 
 import pytest
 
@@ -76,6 +77,8 @@ def test_card_setup_games_and_covers(app, tmp_path, monkeypatch):
     card.mkdir()
     z = pkg.make_package(str(tmp_path / "gammaos-pico-kpa-2026.12.01-sdcard.zip"))
     cardgen.rom(str(card / "roms" / "snes" / "Mine (USA).sfc"))
+    nfd = unicodedata.normalize("NFD", "Pokémon Émeraude (France)")
+    cardgen.rom(str(card / "roms" / "gba" / (nfd + ".gba")))
     app.set_card(volumes.folder_volume(str(card)))
     cp = app.pages[0]
     assert pump(app, lambda: cp.built)
@@ -87,9 +90,12 @@ def test_card_setup_games_and_covers(app, tmp_path, monkeypatch):
     app.show_name("Games")
     gp = app.pages[1]
     assert pump(app, lambda: gp.result is not None)
-    assert sorted(g.name for g in gp.result.games) == ["Collie Defense", "Mine (USA)", "Tobu"]
+    assert sorted(g.name for g in gp.result.games) == ["Collie Defense", "Mine (USA)", nfd, "Tobu"]
+    # the search folds accents, a decomposed name like a composed one
+    gp.query.set("POKÉMON emeraude")
+    assert pump(app, lambda: [g.name for g in gp.list.items] == [nfd])
     gp.query.set("mine")
-    assert pump(app, lambda: len(gp.list.items) == 1)
+    assert pump(app, lambda: [g.name for g in gp.list.items] == ["Mine (USA)"])
     gp.list.select_index(0)
     img = tmp_path / "c.png"
     Image.new("RGB", (200, 280), (40, 90, 200)).save(str(img))

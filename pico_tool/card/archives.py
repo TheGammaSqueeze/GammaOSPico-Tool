@@ -6,15 +6,18 @@ listed once under its own name (and says why when it is started). These readers 
 rules and limits, and also give each ROM's size and CRC32 from the archive's own tables, so nothing
 is unpacked to list a card.
 
-ZIP: read from the end record and the central directory (ZIP64 too); names are kept as raw bytes.
+ZIP: read from the end record and the central directory (ZIP64 too); a name is taken as UTF-8 when
+the entry says so (flag bit 11) or its bytes read as UTF-8, else from code page 437.
 7z: the signature header, then the (possibly LZMA packed) header tables, from the public 7z format
-description; LZMA and LZMA2 headers are unpacked with the standard library's lzma module.
+description; LZMA and LZMA2 headers are unpacked with the standard library's lzma module. Names
+are UTF-16, read as UTF-8.
 """
 
 import lzma
 import struct
 import zlib
 
+from .names import display_text, from_bytes, name_from_7z
 
 
 # the console's reasons (rom_archive.h RA_ERR_*)
@@ -53,7 +56,7 @@ class Member(object):
     __slots__ = ("raw", "text", "crc", "size", "status")
 
     def __init__(self, raw, text, crc, size, status=OK):
-        self.raw = raw          # the console's name for it (one char per byte / per unit rule)
+        self.raw = raw          # the console's name for it, UTF-8 (names.py)
         self.text = text        # the same name for the screen
         self.crc = crc          # CRC32 from the archive's tables, None when it has none
         self.size = size        # unpacked size
@@ -156,9 +159,10 @@ def _zip_list(f, size, exts):
         if i + 46 + nlen + xlen + clen > cd_size:
             raise ArchiveError(ERR_DAMAGED)
         raw = bytes(cd[i + 46:i + 46 + min(nlen, 255)])
-        name = raw.decode("latin-1")
-        if _ext_match(name, exts):
-            flags, method = _u16(cd, i + 8), _u16(cd, i + 10)
+        flags = _u16(cd, i + 8)
+        if _ext_match(from_bytes(raw.split(b"\x00", 1)[0]), exts):     # on the bytes as they are
+            name = _zip_name(raw, flags & 0x800)
+            method = _u16(cd, i + 10)
             crc, csize, usize = _u32(cd, i + 16), _u32(cd, i + 20), _u32(cd, i + 24)
             disk = _u16(cd, i + 34)
             x, xe = i + 46 + nlen, i + 46 + nlen + xlen
@@ -180,10 +184,7 @@ def _zip_list(f, size, exts):
                     if loc == 0xFFFFFFFF and v + 8 <= x + 4 + n:
                         loc = _u64(cd, v)
                 x += 4 + n
-            if flags & 0x800:
-                text = raw.decode("utf-8", "replace")
-            else:
-                text = raw.decode("cp437", "replace")
+            text = display_text(name)
             status = OK
             if disk not in (0, 0xFFFF):
                 status = ERR_SPLIT
@@ -198,6 +199,35 @@ def _zip_list(f, size, exts):
             out.append(Member(name, text, crc, usize, status))
         i += 46 + nlen + xlen + clen
     return out
+
+
+def _is_utf8(b):
+    """Do the bytes read as UTF-8, every character whole (the console's own check)?"""
+    i, n = 0, len(b)
+    while i < n:
+        c = b[i]
+        more = 0 if c < 0x80 else 1 if c & 0xE0 == 0xC0 else 2 if c & 0xF0 == 0xE0 else 3 if c & 0xF8 == 0xF0 else 4
+        if more == 4 or (more and (c < 0xC2 or i + more >= n)):
+            return False
+        for k in range(1, more + 1):
+            if b[i + k] & 0xC0 != 0x80:
+                return False
+        i += 1 + more
+    return True
+
+
+def _zip_name(raw, utf8_flag):
+    """A zip entry's name as the console lists it: its bytes when marked UTF-8 or when they read as
+    UTF-8, else code page 437 in UTF-8 (at most 511 bytes, whole characters)."""
+    if utf8_flag or _is_utf8(raw):
+        return from_bytes(raw[:511].split(b"\x00", 1)[0])
+    out = bytearray()
+    for ch in raw.split(b"\x00", 1)[0].decode("cp437"):
+        b = ch.encode("utf-8")
+        if len(out) + len(b) > 511:
+            break
+        out += b
+    return out.decode("utf-8")
 
 
 # ---- 7z ----------------------------------------------------------------------------------------
@@ -643,7 +673,7 @@ def _sz_list(f, size, exts):
         if stream >= nsub:
             raise ArchiveError(ERR_DAMAGED)
         text = b"".join(struct.pack("<H", u) for u in units).decode("utf-16-le", "replace")
-        raw = "".join(chr(u) if u < 0x80 else "_" for u in units[:255])
+        raw = name_from_7z(units)
         if _ext_match(raw, exts):
             fo = st.fold[fold_of[stream]]
             status = OK

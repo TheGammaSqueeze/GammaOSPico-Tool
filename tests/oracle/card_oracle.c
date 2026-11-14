@@ -8,9 +8,17 @@
  *                                         own FAT writer, in the order the folder lists them
  *   card_oracle list <image> [max]        list the games with the console's own scanner: a line
  *                                         "TOTAL <listed> <found>", then a line per game:
- *                                         type, folder, archive kind, member, size, name (tabs)
+ *                                         type, folder, archive kind, member, size, name, the
+ *                                         name it shows (tabs)
  *   card_oracle art  <image>              for each game, the size of the box art the console's
  *                                         loader reads for it (0 none), then its name (tabs)
+ *   card_oracle foldcp                    pico_fold_cp of every code point that it changes,
+ *                                         "<code point> <folded>" in hex, a line each
+ *   card_oracle names                     for each line of stdin (a name in UTF-8): its
+ *                                         pico_fold_ascii, gba_sd_legacy_key and whether that
+ *                                         differs (tabs)
+ *   card_oracle u16  <hex units...>       the name fat_readdir gives for these UTF-16 units, its
+ *                                         UTF-8 bytes in hex
  */
 #include <dirent.h>
 #include <stdio.h>
@@ -23,6 +31,8 @@
 #include "sd_fat.h"
 #include "gba_boxart_sd.h"
 #include "gba_boxart.h"
+#include "gba_sd_save.h"
+#include "pico_fold.h"
 
 static FILE *img;
 
@@ -93,7 +103,35 @@ static int copy_tree(const char *host, const char *card)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3) { fprintf(stderr, "usage: card_oracle put|list <image> ...\n"); return 2; }
+	if (argc >= 2 && !strcmp(argv[1], "foldcp")) {
+		uint32_t c;
+		for (c = 0; c < 0x30000; c++)
+			if (pico_fold_cp(c) != c) printf("%x %x\n", c, pico_fold_cp(c));
+		return 0;
+	}
+	if (argc >= 2 && !strcmp(argv[1], "names")) {
+		static char line[4096];
+		while (fgets(line, sizeof line, stdin)) {
+			char fa[600], lk[128];
+			int L = (int)strlen(line), d;
+			if (L && line[L - 1] == '\n') line[--L] = 0;
+			pico_fold_ascii(line, fa, sizeof fa);
+			d = gba_sd_legacy_key(line, lk, sizeof lk);
+			printf("%s\t%s\t%d\n", fa, lk, d);
+		}
+		return 0;
+	}
+	if (argc >= 2 && !strcmp(argv[1], "u16")) {
+		uint16_t u[300];
+		char out[256];
+		int n = 0, i, o;
+		for (i = 2; i < argc && n < 300; i++) u[n++] = (uint16_t)strtoul(argv[i], 0, 16);
+		o = fat_u16_name(u, n, out, sizeof out);
+		for (i = 0; i < o; i++) printf("%02x", (unsigned char)out[i]);
+		printf("\n");
+		return 0;
+	}
+	if (argc < 3) { fprintf(stderr, "usage: card_oracle put|list|art <image> ...\n"); return 2; }
 	img = fopen(argv[2], "r+b");
 	if (!img || gba_sd_mount(&vol) != 0) { fprintf(stderr, "the image could not be mounted\n"); return 1; }
 	if (!strcmp(argv[1], "put") && argc >= 4) {
@@ -109,8 +147,8 @@ int main(int argc, char **argv)
 		n = gba_sd_list_roms(&vol, games, max, &total);
 		printf("TOTAL %d %d\n", n, total);
 		for (i = 0; i < n; i++)
-			printf("%d\t%s\t%d\t%d\t%u\t%s\n", games[i].type, gba_sd_rom_dir(&games[i]), games[i].arc,
-			       games[i].member, games[i].size, games[i].name);
+			printf("%d\t%s\t%d\t%d\t%u\t%s\t%s\n", games[i].type, gba_sd_rom_dir(&games[i]), games[i].arc,
+			       games[i].member, games[i].size, games[i].name, games[i].uname);
 		fclose(img);
 		return 0;
 	}

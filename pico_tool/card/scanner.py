@@ -13,8 +13,9 @@ being left out:
 Folder and extension names are matched without case. Empty files and names starting with "." are
 skipped. A .zip or .7z in a system folder is listed as the ROMs inside it (its own name when it
 holds one ROM or cannot be read), and a ROM that is also on the card unpacked is listed from the
-unpacked file. The list is sorted by name without case, stably. The console keeps at most 64 game
-folders and 32768 games.
+unpacked file. Names are the real ones, in UTF-8 (names.py). The list is sorted by name with the
+accents folded and A-Z in either case alike, stably. The console keeps at most 64 game folders and
+32768 games.
 """
 
 import os
@@ -22,7 +23,8 @@ import threading
 
 from . import archives
 from .fsview import CardFS
-from .names import NAME_MAX, base_ext, clean_title, display_text, ends_with_any, fold
+from .names import (NAME_MAX, LegacyForms, ascii_fold, clean_title, cut_bytes, cut_u8, display_text,
+                    ends_with_any, from_bytes, named_forms, sort_key)
 from .systems import BY_TYPE, system_for_folder
 
 GAMES_MAX = 32768
@@ -56,7 +58,7 @@ class Game(object):
 
     def __init__(self, gtype, name, cdir, osdir, osfile, arc, member, size):
         self.type = gtype           # the system's type number (systems.SYSTEMS)
-        self.name = name            # the console's name: label key, saves, states, box art
+        self.name = name            # the console's name (UTF-8, at most 127 bytes): saves, states, box art
         self.title = ""             # the menu's title
         self.cdir = cdir            # its folder, as the console writes the path ("/ROMs/gba")
         self.dir = osdir            # that folder on the computer
@@ -100,6 +102,8 @@ class ScanResult(object):
         self.folders_txt = False    # /gammaos/folders.txt is on the card
         self.skipped_folders = 0    # game folders past the 64 the console reads
         self.archive_errors = 0
+        self.legacy = None          # the games' underscore forms (names.LegacyForms), None when the
+                                    # list was cut short (the console then reads no old form)
 
     def by_type(self, gtype):
         return [g for g in self.games if g.type == gtype]
@@ -112,8 +116,8 @@ class ScanResult(object):
 
 
 def _join(a, b):
-    """path_join: "a/b", cut to the console's 95 characters."""
-    return (a + "/" + b)[:PATH_CAP - 1]
+    """path_join: "a/b", cut to the console's 95 bytes."""
+    return cut_bytes(a + "/" + b, PATH_CAP - 1)
 
 
 class ArchiveCache(object):
@@ -124,8 +128,10 @@ class ArchiveCache(object):
         self.store = store if store is not None else {}
         self.lock = threading.Lock()
 
+    FORMAT = 2              # the names kept: 2 in UTF-8 (the console's archives.idx format 2)
+
     def get(self, path, size, mtime, kind, exts):
-        key = "%s|%d|%d|%s|%s" % (path, size, int(mtime), kind, ",".join(exts))
+        key = "%d|%s|%d|%d|%s|%s" % (self.FORMAT, path, size, int(mtime), kind, ",".join(exts))
         with self.lock:
             hit = self.store.get(key)
         if hit is not None:
@@ -161,7 +167,7 @@ class Scanner(object):
         self.cancel = cancel            # threading.Event
         self.res = ScanResult(self.fs.root)
         self._dirs = []                 # identities of the game folders listed so far
-        self._dup = {}                  # (type, folded name) -> Game
+        self._dup = {}                  # (type, name with A-Z small) -> Game
 
     # one game into the list (add_game)
     def _add(self, sysm, di, osfile, nm, arc, member, size, member_info=None):
@@ -171,8 +177,10 @@ class Scanner(object):
         if len(res.games) >= self.max_games:
             res.total += 1
             return
-        key = (sysm.type, fold(nm))
-        was = self._dup.get(key)
+        # the console compares names as it keeps them (cut at 127 bytes), so a game in two folders
+        # is found again even when its name is longer than that
+        key = cut_u8(nm, NAME_MAX)
+        was = self._dup.get((sysm.type, ascii_fold(key)))
         if was is not None:
             if was.arc and not arc:     # the ROM itself beats the same game in an archive
                 was.file = osfile
@@ -188,7 +196,7 @@ class Scanner(object):
                 _rom_status(was)
             return
         cdir, osdir = res.folders[di]
-        g = Game(sysm.type, nm[:NAME_MAX], cdir, osdir, osfile, arc, member, size)
+        g = Game(sysm.type, key, cdir, osdir, osfile, arc, member, size)
         if member_info is not None:
             g.member_text = member_info.text
             g.crc = member_info.crc
@@ -198,7 +206,7 @@ class Scanner(object):
             g.status = archives.OK
         _rom_status(g)
         res.games.append(g)
-        self._dup[key] = g
+        self._dup[(sysm.type, ascii_fold(key))] = g
         res.total += 1
 
     def _folder(self, cpath, ident, sysm):
@@ -217,7 +225,7 @@ class Scanner(object):
             return
         di = len(self._dirs)
         self._dirs.append(ident)
-        res.folders.append((cpath[:PATH_CAP - 1], osdir))
+        res.folders.append((cut_bytes(cpath, PATH_CAP - 1), osdir))
         if self.progress:
             self.progress("Reading %s" % cpath)
         exts = sysm.exts
@@ -237,7 +245,7 @@ class Scanner(object):
                     if not el:
                         continue
                     arc = ARC_7Z
-            nm = e.cname[:len(e.cname) - el][:NAME_MAX]
+            nm = e.cname[:len(e.cname) - el]
             if arc:
                 el2 = ends_with_any(nm, exts)
                 if el2:
@@ -262,9 +270,9 @@ class Scanner(object):
                     res.games[-1].size = 0
                 continue
             for m, mem in enumerate(members):
-                rn = mem.raw[:NAME_MAX]
+                rn = cut_u8(mem.raw, NAME_MAX)          # as archives.idx keeps it
                 st = max(rn.rfind("/"), rn.rfind("\\")) + 1
-                rn = rn[st:][:NAME_MAX]
+                rn = rn[st:]
                 el2 = ends_with_any(rn, exts)
                 if el2:
                     rn = rn[:len(rn) - el2]
@@ -307,7 +315,7 @@ class Scanner(object):
                 data = f.read(FOLDERS_MAX)
         except OSError:
             return
-        text = data.split(b"\x00", 1)[0].decode("latin-1")
+        text = from_bytes(data.replace(b"\x00", b"\n"))      # a stray NUL ends a line
         for line in text.split("\n"):
             line = line.rstrip("\r \t").lstrip(" \t")
             if not line or line[0] == "#":
@@ -337,7 +345,7 @@ class Scanner(object):
         self._root("/roms")
         self._root("")
         for e in self.fs.listdir(self.fs.root) or ():
-            if not e.is_dir or _not_a_rom_root(e.cname) or fold(e.cname) == "roms":
+            if not e.is_dir or _not_a_rom_root(e.cname) or ascii_fold(e.cname) == "roms":
                 continue
             if system_for_folder(e.cname) is not None:
                 continue
@@ -345,10 +353,12 @@ class Scanner(object):
             self._root(top)
             self._root(_join(top, "roms"))
         self._user_folders()
-        res.games.sort(key=lambda g: fold(g.name))
+        res.games.sort(key=lambda g: sort_key(g.name))
         for i, g in enumerate(res.games):
             g.index = i
             g.title = clean_title(g.name)
+        if res.total <= len(res.games):
+            res.legacy = LegacyForms(g.name for g in res.games)
         return res
 
 
@@ -367,7 +377,7 @@ def _ident(path):
 
 
 def _not_a_rom_root(nm):
-    low = fold(nm)
+    low = ascii_fold(nm)
     return nm.startswith(".") or low in NOT_ROM_ROOTS or low in ("system volume information", "lost.dir")
 
 
@@ -396,8 +406,7 @@ def write_folders_template(root):
     return p
 
 
-def art_names(g):
-    """The .ART names the console tries for a game: its own, then the older cut one."""
-    a = base_ext(g.name, "ART")
-    b = base_ext(g.name, "ART", legacy=True)
-    return (a,) if a == b else (a, b)
+def art_names(g, legacy=None):
+    """The .ART names the console tries for a game, in order (gba_sd_read_named): its own, the
+    older one cut at the last dot, then its underscore form when no other game has it."""
+    return named_forms(g.name, "ART", legacy)

@@ -73,10 +73,15 @@ the first time, right-click it and choose **Open**.
   the same order, a game found twice listed once, `.zip` and `.7z` archives listed as the games
   inside them, and the console's limits. It says which games the console will not start, and
   why (a password-protected archive, a compression it does not open, a game too large).
+- Names in any script are shown as they are on the card (accents, Greek, Cyrillic, Japanese,
+  Korean, Arabic, emoji), sorted the console's way: accents folded, so "Pokémon" sits with
+  "Pokemon", and other scripts after A to Z. Searching ignores accents too.
 - Shows each game's cover, and finds the missing ones from **ScreenScraper** (by the ROM's CRC
   and name; release builds have access built in, your own free account adds quota) or
   **TheGamesDB** (with your own API key). Covers are written as the console's own `.ART` files,
-  exactly where it reads them.
+  exactly where it reads them, under the game's own name. A cover an older version of GammaOS
+  Pico named with a "_" for each letter outside ASCII is still found, as long as no other game
+  shares that name.
 - Search by hand and pick from the candidates, use any picture file, or remove a cover.
 - Stays quick with libraries of tens of thousands of games.
 

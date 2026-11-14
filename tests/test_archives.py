@@ -89,10 +89,12 @@ def test_7z_split_parts_and_damage(tmp_path):
 
 
 @needs7z
-def test_7z_non_ascii_names_become_underscores(tmp_path):
-    p = cardgen.make_7z(str(tmp_path / "x.7z"), {"Pokémon.gba": b"x" * 100}, [], str(tmp_path))
+def test_7z_names_in_any_script_are_kept(tmp_path):
+    names = ["Pokémon.gba", "ポケモン.gba", "Smile \U0001F600.gba", "Ελληνικά.gba", "e\u0301t\u00e9.gba"]
+    p = cardgen.make_7z(str(tmp_path / "x.7z"), {n: b"x" * 100 for n in names}, [], str(tmp_path))
     m = listing(p)
-    assert m[0].raw == "Pok_mon.gba" and m[0].text == "Pokémon.gba"
+    assert sorted(x.raw for x in m) == sorted(names)
+    assert all(x.raw == x.text for x in m)
 
 
 @needs7z
@@ -132,15 +134,42 @@ def test_zip64_end_records(tmp_path):
     assert [x.raw for x in listing(p)] == ["a.gba", "b.gba"]
 
 
-def test_zip_with_a_long_comment_and_raw_names(tmp_path):
+def test_zip_with_a_long_comment_and_utf8_names(tmp_path):
     p = str(tmp_path / "x.zip")
     with zipfile.ZipFile(p, "w") as z:
         z.comment = b"c" * 5000
         info = zipfile.ZipInfo("Café.gba")
         z.writestr(info, b"x" * 10)
     m = listing(p)
-    # flagged UTF-8 by Python: the console keeps the bytes as they are
-    assert m[0].raw == "CafÃ©.gba" and m[0].text == "Café.gba"
+    # flagged UTF-8 by Python: the name as it is
+    assert m[0].raw == "Café.gba" and m[0].text == "Café.gba"
+
+
+def test_zip_names_utf8_flag_cp437_and_raw_bytes(tmp_path):
+    p = cardgen.raw_zip(str(tmp_path / "x.zip"), [
+        ("Café.gba".encode("utf-8"), 0x800, b"a"),          # marked UTF-8
+        ("Ñandú.gba".encode("utf-8"), 0, b"b"),             # not marked, but reads as UTF-8
+        (b"Caf\x82 \x9a.gba", 0, b"c"),                     # code page 437: e acute, U umlaut
+        (b"Bad\xff.gba", 0x800, b"d"),                      # marked UTF-8 and not: bytes kept
+        (b"\xb0" * 250 + b".gba", 0, b"e"),                 # 437 to UTF-8 is cut at 511 bytes
+    ])
+    m = listing(p)
+    assert [x.raw for x in m[:3]] == ["Café.gba", "Ñandú.gba", "Café Ü.gba"]
+    assert m[3].raw.encode("utf-8", "surrogateescape") == b"Bad\xff.gba" and m[3].text == "Bad\ufffd.gba"
+    # the extension is matched on the bytes as they are, so the cut name is still listed
+    assert m[4].raw == "\u2591" * 170 and len(m[4].raw.encode("utf-8")) == 510
+
+
+def test_zip_cp437_table_is_the_consoles():
+    src = os.path.join(os.environ.get("GAMMAOS_PICO_LK", "/work/kpa/lk-mt6785"), "emu", "gba", "rom_archive.c")
+    if not os.path.isfile(src):
+        pytest.skip("the console sources are not here")
+    import re
+    text = open(src).read()
+    body = text[text.index("k_cp437[128]"):]
+    body = body[body.index("{") + 1:body.index("};")]
+    table = [int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{4})", body)]
+    assert table == [ord(bytes([b]).decode("cp437")) for b in range(0x80, 0x100)]
 
 
 @needs7z

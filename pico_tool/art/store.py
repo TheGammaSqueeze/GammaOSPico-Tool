@@ -1,20 +1,22 @@
 """Where the console finds each game's box art, and writing it there.
 
 For a game the console reads <its folder>/boxart/<name>.ART, then GammaOS Pico's own
-/roms/<system>/boxart/<name>.ART when the game is kept elsewhere. <name> is the game's name with a
-ROM extension left on it dropped; files written by older versions under the name cut at its last
-dot are read too. At power on a <name>.png (or <name>.<rom extension>.png) in those folders is
-turned into the .ART and deleted, so a PNG waiting there counts as a cover to come.
+/roms/<system>/boxart/<name>.ART when the game is kept elsewhere. <name> is the game's name (UTF-8,
+as the card has it) with a ROM extension left on it dropped. In each folder it also reads the files
+older versions wrote: the name cut at its last dot, and the underscore form versions before 1.1
+used for names outside ASCII ("_" for each such character), the latter only when no other game of
+the library has the same form. The first of those names that holds anything decides for the
+folder. At power on a <name>.png (or <name>.<rom extension>.png) in those folders is turned into
+<name>.ART and deleted, so a PNG waiting there counts as a cover to come.
 
-Covers are written beside the game, under a name the console will match: the game's own file name
-when it reads back the same, else the console's form of it ("_" for the letters it cannot show).
+Covers are always written beside the game under the game's own name.
 """
 
 import os
 
 from ..card.fsview import CardFS
-from ..card.names import NAME_MAX, base_ext, console_name, ends_with_any, fat_safe, fold
-from ..card.scanner import ARC_ZIP, art_names
+from ..card.names import ascii_fold, base_ext, fat_safe
+from ..card.scanner import art_names
 from ..card.systems import BY_TYPE, home_art_dir, home_dir
 from . import artfile
 
@@ -28,11 +30,15 @@ CANNOT = "cannot"         # the name cannot match any file on a FAT or exFAT car
 
 
 class ArtIndex(object):
-    """The box art folders of a card, listed once, to answer for thousands of games quickly."""
+    """The box art folders of a card, listed once, to answer for thousands of games quickly.
 
-    def __init__(self, root, fs=None):
+    `legacy` is the listing's ScanResult.legacy: which underscore forms are a game's own. Without
+    it no file under an underscore form is read, as on a console that has no full listing."""
+
+    def __init__(self, root, fs=None, legacy=None):
         self.root = os.path.abspath(root)
         self.fs = fs or CardFS(self.root)
+        self.legacy = legacy
         self._dirs = {}
 
     def invalidate(self, osdir=None):
@@ -47,21 +53,21 @@ class ArtIndex(object):
                     self.fs._cache.pop(k, None)
 
     def _art_folder(self, osdir):
-        """{folded console name: (file name, size)} of <osdir>/boxart, and its path (None when
-        there is no such folder)."""
+        """{console name with A-Z small: (file name, size)} of <osdir>/boxart, the first file of
+        each name in the folder's order, and its path (None when there is no such folder)."""
         hit = self._dirs.get(osdir)
         if hit is not None:
             return hit
         folder = None
         files = {}
         for e in self.fs.listdir(osdir) or ():
-            if e.is_dir and fold(e.cname) == ART_DIR:
+            if e.is_dir and ascii_fold(e.cname) == ART_DIR:
                 folder = e.path
                 break
         if folder:
             for e in self.fs.listdir(folder) or ():
                 if not e.is_dir:
-                    files.setdefault(fold(e.cname), (e.name, e.size))
+                    files.setdefault(ascii_fold(e.cname), (e.name, e.size))
         hit = (folder, files)
         self._dirs[osdir] = hit
         return hit
@@ -73,18 +79,22 @@ class ArtIndex(object):
     def candidates(self, game):
         """[(folder of the game's dir, is_home)] the console reads, in order."""
         out = [(game.dir, False)]
-        if fold(game.cdir + "/boxart") != fold(home_art_dir(BY_TYPE[game.type])):
+        if ascii_fold(game.cdir + "/boxart") != ascii_fold(home_art_dir(BY_TYPE[game.type])):
             h = self._home(game)
             if h:
                 out.append((h, True))
         return out
 
+    def art_names(self, game):
+        """The .ART names the console tries for the game in each folder, in order."""
+        return art_names(game, self.legacy)
+
     def find(self, game):
         """(state, path): the cover the console would show, a PNG waiting, or none."""
         if not art_possible(game):
             return CANNOT, None
-        names = [fold(n) for n in art_names(game)]
-        pngs = _png_names(game)
+        names = [ascii_fold(n) for n in self.art_names(game)]
+        pngs = _png_names(names)
         waiting = None
         for osdir, _home in self.candidates(game):
             folder, files = self._art_folder(osdir)
@@ -92,8 +102,11 @@ class ArtIndex(object):
                 continue
             for n in names:
                 hit = files.get(n)
-                if hit and hit[1] >= artfile.HEADER:
-                    return HAVE_ART, os.path.join(folder, hit[0])
+                if hit and hit[1]:
+                    # the first name holding anything decides for this folder (gba_sd_read_named)
+                    if hit[1] >= artfile.HEADER:
+                        return HAVE_ART, os.path.join(folder, hit[0])
+                    break
             if waiting is None:
                 for n in pngs:
                     hit = files.get(n)
@@ -106,9 +119,10 @@ class ArtIndex(object):
 
     def matches(self, game):
         """Every file in the folders the console reads that counts as this game's cover
-        (.ART under either name, waiting PNGs)."""
+        (.ART under any of its names, waiting PNGs)."""
         out = []
-        names = [fold(n) for n in art_names(game)] + _png_names(game)
+        names = [ascii_fold(n) for n in self.art_names(game)]
+        names += _png_names(names)
         for osdir, _home in self.candidates(game):
             folder, files = self._art_folder(osdir)
             if not folder:
@@ -125,63 +139,26 @@ def art_stem(game):
     exFAT card can match the game's name."""
     if game.art_stem is not None:
         return game.art_stem or None
-    stem = _art_stem(game)
+    stem = base_ext(game.name, "ART")[:-4]
+    if not fat_safe(stem + ".ART"):
+        stem = None
     game.art_stem = stem or ""
     return stem
-
-
-def _art_stem(game):
-    target = base_ext(game.name, "ART")[:-4]
-    nice = _unicode_name(game)
-    if nice is not None:
-        nice = base_ext(nice, "ART")[:-4]
-        if fold(console_name(nice)) == fold(target) and fat_safe(nice + ".ART"):
-            return nice
-    if not target.isascii() or not fat_safe(target + ".ART"):
-        return None
-    return target
-
-
-def _unicode_name(game):
-    """The game's name the way the computer shows it (the console's name keeps only ASCII), or
-    None when it cannot be told."""
-    exts = BY_TYPE[game.type].exts
-    if game.by_file:
-        base = os.path.basename(game.file)
-        own = exts if not game.arc else ((".zip",) if game.arc == ARC_ZIP else (".7z",))
-        el = ends_with_any(console_name(base), own)
-        if not el:
-            return None
-        base = _cut_units(base, min(len(console_name(base)) - el, NAME_MAX))
-        if game.arc:
-            el = ends_with_any(console_name(base), exts)
-            if el:
-                base = _cut_units(base, len(console_name(base)) - el)
-        return base
-    if game.arc == ARC_ZIP or game.member_text is None:
-        return None
-    inner = _cut_units(game.member_text, NAME_MAX)
-    inner = inner.replace("\\", "/").rsplit("/", 1)[-1]
-    el = ends_with_any(console_name(inner), exts)
-    return _cut_units(inner, len(console_name(inner)) - el) if el else inner
-
-
-def _cut_units(s, n):
-    """The first n UTF-16 units of s (as the console counts a name)."""
-    raw = s.encode("utf-16-le", "surrogatepass")[:2 * max(0, n)]
-    return raw.decode("utf-16-le", "ignore")
 
 
 def art_possible(game):
     return art_stem(game) is not None
 
 
-def _png_names(game):
-    """The PNG names the console's import turns into this game's .ART (folded)."""
-    a = base_ext(game.name, "ART")[:-4]
-    out = [fold(a + ".png")]
-    for e in PNG_ROM_EXTS:
-        out.append(fold(a + e + ".png"))
+def _png_names(art_names):
+    """The PNG names (A-Z small) the console's import turns into one of these .ART names: the
+    PNG's name without ".png", a ROM extension left on it dropped, becomes the .ART's."""
+    out = []
+    for a in art_names:
+        stem = a[:-4]
+        out.append(stem + ".png")
+        for e in PNG_ROM_EXTS:
+            out.append(stem + e + ".png")
     return out
 
 
@@ -200,12 +177,21 @@ def write_art(index, game, art_bytes):
     dest = os.path.join(folder, stem + ".ART")
     # the old cover and waiting PNGs in this folder go (a PNG would replace the new cover at the
     # next power on); another case of the same name is one file on the card
-    names = set(fold(n) for n in art_names(game)) | set(_png_names(game))
+    names = [ascii_fold(n) for n in index.art_names(game)]
+    names = set(names) | set(_png_names(names))
     for e in index.fs.listdir(folder) or ():
-        if not e.is_dir and fold(e.cname) in names and os.path.normcase(e.path) != os.path.normcase(dest):
+        if not e.is_dir and ascii_fold(e.cname) in names and os.path.normcase(e.path) != os.path.normcase(dest):
             _remove(e.path)
     atomic_write(dest, art_bytes)
     index.invalidate(game.dir)
+    # the console finds it only under the very characters of the game's name: a computer that
+    # stores names in another Unicode form would leave a cover it never reads
+    want = ascii_fold(stem + ".ART")
+    if not any(not e.is_dir and ascii_fold(e.cname) == want for e in index.fs.listdir(folder) or ()):
+        _remove(dest)
+        index.invalidate(game.dir)
+        raise artfile.ArtError("This computer changed the cover's file name, so the console would not "
+                               "find it")
     return dest
 
 

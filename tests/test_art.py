@@ -2,6 +2,7 @@ import io
 import os
 import struct
 import sys
+import unicodedata
 
 import pytest
 from PIL import Image
@@ -78,6 +79,8 @@ def _card(tmp_path):
     with zipfile.ZipFile(str(tmp_path / "roms" / "gba" / "Raw.zip"), "w") as z:
         z.writestr("Naïve.gba", b"n" * 50)
         z.writestr("Plain.gba", b"p" * 50)
+    cardgen.raw_zip(str(tmp_path / "roms" / "gba" / "Odd.zip"),
+                    [(b"Bad\xff.gba", 0x800, b"b" * 50), (b"Fine.gba", 0, b"f" * 50)])
     return scan_card(str(tmp_path))
 
 
@@ -85,22 +88,27 @@ def art():
     return artfile.encode(Image.new("RGB", (40, 40), (1, 2, 3)))
 
 
+def _index(tmp_path, res):
+    return store.ArtIndex(str(tmp_path), legacy=res.legacy)
+
+
 @pytest.mark.skipif(not cardgen.SEVENZ, reason="7z is not installed")
 def test_write_find_remove(tmp_path):
     res = _card(tmp_path)
     by = {g.name: g for g in res.games}
-    idx = store.ArtIndex(str(tmp_path))
-    g = by["Pok_mon (France)"]
+    idx = _index(tmp_path, res)
+    g = by["Pokémon (France)"]
     assert idx.find(g) == (store.NO_ART, None)
     p = store.write_art(idx, g, art())
-    assert os.path.basename(p) == "Pokémon (France).ART"      # the name as the computer shows it
+    assert os.path.basename(p) == "Pokémon (France).ART"      # always under the game's own name
     assert idx.find(g)[0] == store.HAVE_ART
-    # a 7z member with an accent: written under a name the console matches
-    c = by["Caf_"]
-    assert os.path.basename(store.write_art(idx, c, art())) == "Café.ART"
-    # a ZIP member's raw UTF-8 bytes never match a file on the card
-    assert idx.find(by["NaÃ¯ve"])[0] == store.CANNOT
+    # archive members in any script, by their own names
+    assert os.path.basename(store.write_art(idx, by["Café"], art())) == "Café.ART"
+    assert os.path.basename(store.write_art(idx, by["Naïve"], art())) == "Naïve.ART"
     assert os.path.basename(store.write_art(idx, by["Plain"], art())) == "Plain.ART"
+    # bytes that are not UTF-8 can never be a file's name on the card
+    bad = [x for x in res.games if x.name.startswith("Bad")][0]
+    assert idx.find(bad)[0] == store.CANNOT
     # the old cut name is read, and replaced by the full one when a new cover is written
     m = by["Mario vs. Donkey Kong"]
     (tmp_path / "roms" / "gba" / "boxart" / "Mario vs.ART").write_bytes(art())
@@ -113,11 +121,70 @@ def test_write_find_remove(tmp_path):
     assert not any(n.startswith("Mario") for n in os.listdir(str(tmp_path / "roms" / "gba" / "boxart")))
 
 
+def test_old_underscore_art_is_found_only_when_not_shared(tmp_path):
+    g = tmp_path / "roms" / "gba"
+    for n in ("Pokémon", "ポケモン", "テトリス", "Café", "Caf_"):
+        cardgen.rom(str(g / (n + ".gba")))
+    box = g / "boxart"
+    box.mkdir()
+    (box / "Pok_mon.ART").write_bytes(art())          # an older version's name, this game's alone
+    (box / "____.ART").write_bytes(art())             # shared by the two Japanese names
+    res = scan_card(str(tmp_path))
+    by = {x.name: x for x in res.games}
+    idx = _index(tmp_path, res)
+    st, path = idx.find(by["Pokémon"])
+    assert st == store.HAVE_ART and path.endswith("Pok_mon.ART")
+    assert idx.find(by["ポケモン"])[0] == store.NO_ART and idx.find(by["テトリス"])[0] == store.NO_ART
+    # "Caf_" is a game's own name, so Café cannot take its cover
+    (box / "Caf_.ART").write_bytes(art())
+    idx.invalidate()
+    assert idx.find(by["Caf_"])[0] == store.HAVE_ART and idx.find(by["Café"])[0] == store.NO_ART
+    # without a full listing no underscore form is read
+    assert store.ArtIndex(str(tmp_path)).find(by["Pokémon"])[0] == store.NO_ART
+    # a new cover goes under the UTF-8 name, and the old one it replaces goes
+    p = store.write_art(idx, by["Pokémon"], art())
+    assert os.path.basename(p) == "Pokémon.ART"
+    left = sorted(os.listdir(str(box)))
+    assert "Pok_mon.ART" not in left and "____.ART" in left and "Caf_.ART" in left
+    # the shared form is never removed for one of its games
+    store.write_art(idx, by["ポケモン"], art())
+    assert "____.ART" in os.listdir(str(box)) and "ポケモン.ART" in os.listdir(str(box))
+
+
+def test_first_name_holding_anything_decides(tmp_path):
+    g = tmp_path / "roms" / "gba"
+    cardgen.rom(str(g / "Pokémon.gba"))
+    box = g / "boxart"
+    box.mkdir()
+    (box / "Pokémon.ART").write_bytes(b"GART")        # too short: the old form is not tried after it
+    (box / "Pok_mon.ART").write_bytes(art())
+    res = scan_card(str(tmp_path))
+    idx = _index(tmp_path, res)
+    assert idx.find(res.games[0])[0] == store.NO_ART
+    (box / "Pokémon.ART").write_bytes(b"")             # empty: as if it were not there
+    idx.invalidate()
+    assert idx.find(res.games[0])[0] == store.HAVE_ART
+
+
+def test_decomposed_name_art(tmp_path):
+    nfd = unicodedata.normalize("NFD", "Pokémon")
+    cardgen.rom(str(tmp_path / "roms" / "gba" / (nfd + ".gba")))
+    res = scan_card(str(tmp_path))
+    idx = _index(tmp_path, res)
+    p = store.write_art(idx, res.games[0], art())
+    assert os.path.basename(p) == nfd + ".ART"
+    assert idx.find(res.games[0]) == (store.HAVE_ART, p)
+    # a composed name is another file for the console
+    os.rename(p, os.path.join(os.path.dirname(p), "Pokémon.ART"))
+    idx.invalidate()
+    assert idx.find(res.games[0])[0] == store.NO_ART
+
+
 @pytest.mark.skipif(not cardgen.SEVENZ, reason="7z is not installed")
 def test_home_folder_and_waiting_png(tmp_path):
     res = _card(tmp_path)
     g = [x for x in res.games if x.name == "Far Away"][0]
-    idx = store.ArtIndex(str(tmp_path))
+    idx = _index(tmp_path, res)
     home = tmp_path / "roms" / "gba" / "boxart"
     home.mkdir(parents=True, exist_ok=True)
     (home / "far away.gba.png").write_bytes(b"png")

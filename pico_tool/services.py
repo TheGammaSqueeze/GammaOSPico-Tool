@@ -30,7 +30,7 @@ class CardSession(object):
         self.archive_store.save()
         with self.lock:
             self.result = res
-            self.index = ArtIndex(self.root)
+            self.index = ArtIndex(self.root, legacy=res.legacy)
         return res
 
     def save_caches(self):
@@ -39,7 +39,8 @@ class CardSession(object):
 
 
 def find_games(result, query, system=None):
-    """Games whose name or title is `query` (any case), else those containing it."""
+    """Games whose name or title is `query` (any case, accents folded as the console's search
+    does), else those containing it."""
     from .card.names import fold
     from .card.systems import BY_KEY, system_for_folder
     sysm = None
@@ -48,8 +49,8 @@ def find_games(result, query, system=None):
         if sysm is None:
             raise ValueError("Unknown system %r (gb gbc gba snes genesis sms gg sg)." % system)
     pool = [g for g in result.games if sysm is None or g.type == sysm.type]
-    q = fold(query)
-    exact = [g for g in pool if fold(g.name) == q or fold(g.title) == q or fold(g.display_name) == q]
+    q = fold(query.strip())
+    exact = [g for g in pool if fold(g.name) == q or fold(g.title) == q]
     if exact:
         return exact
-    return [g for g in pool if q in fold(g.name) or q in fold(g.display_name)]
+    return [g for g in pool if q in fold(g.name) or q in fold(g.title)]

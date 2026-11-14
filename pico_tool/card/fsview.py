@@ -1,14 +1,14 @@
 """The card's folders as the console walks them.
 
-The console opens folders by path, comparing each part with the names it reads (non-ASCII units as
-"_", the letters A-Z without case) and taking the first folder that matches, in the folder's own
-order. These helpers do the same on a mounted card (or any folder), so the listing follows the
-order the console sees: the directory order a FAT or exFAT driver returns.
+The console opens folders by path, comparing each part with the names it reads (UTF-8, the
+letters A-Z without case, every other character as it is) and taking the first folder that
+matches, in the folder's own order. These helpers do the same on a mounted card (or any folder), so
+the listing follows the order the console sees: the directory order a FAT or exFAT driver returns.
 """
 
 import os
 
-from .names import console_name, fold
+from .names import FAT_NAME_MAX, ascii_fold, console_name, from_bytes, to_bytes
 
 
 class Entry(object):
@@ -56,16 +56,13 @@ class CardFS(object):
     def resolve(self, cpath):
         """The folder on the computer for a console path ("/ROMs/gba"), or None (fat_opendir)."""
         cur = self.root
-        for part in cpath.split("/"):
-            if not part:
-                continue
-            part = part[:255]
-            want = fold(part)
+        for part in _parts(cpath):
+            want = ascii_fold(part)
             ents = self.listdir(cur)
             if ents is None:
                 return None
             for e in ents:
-                if e.is_dir and fold(e.cname) == want:
+                if e.is_dir and ascii_fold(e.cname) == want:
                     cur = e.path
                     break
             else:
@@ -77,8 +74,24 @@ class CardFS(object):
         d = self.resolve(cdir)
         if d is None:
             return None
-        want = fold(name)
+        want = ascii_fold(name)
         for e in self.listdir(d) or ():
-            if not e.is_dir and fold(e.cname) == want:
+            if not e.is_dir and ascii_fold(e.cname) == want:
                 return e
         return None
+
+
+def _parts(cpath):
+    """The parts of a console path the way fat_opendir takes them: a part of more than 255 bytes
+    goes on as the next part."""
+    out = []
+    for part in cpath.split("/"):
+        if not part:
+            continue
+        if part.isascii() and len(part) <= FAT_NAME_MAX:
+            out.append(part)
+            continue
+        b = to_bytes(part)
+        for i in range(0, len(b), FAT_NAME_MAX):
+            out.append(from_bytes(b[i:i + FAT_NAME_MAX]))
+    return out

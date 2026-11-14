@@ -53,6 +53,14 @@ def test_art_set_and_rm(tmp_path, capsys):
     assert rc == 1
 
 
+def test_art_set_finds_accented_names(tmp_path, capsys):
+    cardgen.rom(str(tmp_path / "card" / "roms" / "gba" / "Pokémon Émeraude (France).gba"))
+    img = tmp_path / "c.png"
+    Image.new("RGB", (300, 300), (9, 9, 9)).save(str(img))
+    rc, out, err = run(capsys, "art", "set", str(tmp_path / "card"), "pokemon emeraude", str(img))
+    assert rc == 0 and (tmp_path / "card" / "roms" / "gba" / "boxart" / "Pokémon Émeraude (France).ART").exists()
+
+
 def test_bios(tmp_path, capsys):
     (tmp_path / "card").mkdir()
     b = tmp_path / "b.bin"

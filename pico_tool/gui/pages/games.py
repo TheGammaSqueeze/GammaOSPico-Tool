@@ -13,6 +13,7 @@ from PIL import Image, ImageTk
 from ...art import artfile, store
 from ...card import archives
 from ...card.hashing import game_crc
+from ...card.names import fold
 from ...card.systems import SYSTEMS
 from ...scrape import batch, scraper
 from .. import images, theme, widgets
@@ -181,7 +182,8 @@ class GamesPage(Page):
         def done(r):
             self.scanning = False
             self.result, self.states = r
-            self.hay = {g.index: (g.display_name + " " + g.title + " " + os.path.basename(g.file)).lower()
+            # the console's search folds accents and treats a decomposed name like a composed one
+            self.hay = {g.index: fold(g.display_name + " " + g.title + " " + os.path.basename(g.file))
                         for g in self.result.games}
             self.thumbs.reset()
             res = self.result
@@ -229,8 +231,7 @@ class GamesPage(Page):
         self._fjob = None
         if not self.result:
             return
-        q = self.query.get().strip().lower()
-        words = q.split()
+        words = fold(self.query.get().strip()).split()
         out = []
         for g in self.result.games:
             if self.system is not None and g.type != self.system:
