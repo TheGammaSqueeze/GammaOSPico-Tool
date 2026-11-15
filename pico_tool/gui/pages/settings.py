@@ -1,8 +1,9 @@
-"""The Settings tab: the look, the scrapers and their accounts, where backups go."""
+"""The Settings tab: the look, the person's console, the scrapers and their accounts."""
 
 import tkinter as tk
 
 from ... import config
+from ...console.models import MODELS, by_key
 from ...scrape import scraper
 from .. import images, theme, widgets
 from ..app import Page
@@ -44,6 +45,16 @@ class SettingsPage(Page):
         self.demo = tk.BooleanVar(value=bool(st.get("include_demo_games")))
         widgets.Switch(L, ctx, "Put the free demo games on new cards", self.demo,
                        command=lambda: st.set("include_demo_games", bool(self.demo.get()))).pack(anchor="w", pady=(S(10), 0))
+        tk.Frame(L, bg=p.line, height=1).pack(fill="x", pady=S(18))
+        widgets.section(L, ctx, "Your console").pack(anchor="w")
+        widgets.label(L, ctx, "Which console's packages the tool downloads. The Console tab sets it by itself "
+                      "when a console is connected.", 12, color=p.muted, wraplength=S(360)).pack(anchor="w", fill="x",
+                                                                                         pady=(S(4), S(6)))
+        self.model = tk.StringVar(value=self.app.console_model().key)
+        for m in MODELS:
+            widgets.Radio(L, ctx, m.name, self.model, m.key,
+                          command=lambda: self.app.root.after_idle(
+                              lambda: self.app.set_console_model(by_key(self.model.get())))).pack(anchor="w", pady=S(4))
         tk.Frame(L, bg=p.line, height=1).pack(fill="x", pady=S(18))
         widgets.section(L, ctx, "Where the tool keeps its things").pack(anchor="w")
         widgets.label(L, ctx, "Settings: %s" % config.config_dir(), 11, color=p.dim, wraplength=S(380)).pack(anchor="w", fill="x", pady=(S(8), 0))
@@ -106,6 +117,11 @@ class SettingsPage(Page):
         lw = max(S(340), min(S(440), int(w * 0.38)))
         gap = S(18)
         return [((x, y, lw, h), self.left), ((x + lw + gap, y, w - lw - gap, h), self.right)]
+
+    def on_console_model(self):
+        key = self.app.console_model().key
+        if self.model.get() != key:
+            self.model.set(key)
 
     def _save_soon(self):
         if self._job:

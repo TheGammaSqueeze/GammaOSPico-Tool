@@ -1,9 +1,11 @@
 """Finding the console on USB, telling it apart from other fastboot devices, and reading lk_a/lk_b.
 
-A device is accepted when its fastboot answers getvar:product with "k85v1_64_kpa" (the project
-GammaOS Pico's LK is built as). getvar:version-gammaos-pico gives "<version> <commit>"; LKs built
-before that variable existed answer FAIL and are still GammaOS Pico, with an unknown version.
-The stock Konkr LK answers "k85v1_64" (shared with other MT6785 handhelds) and is refused.
+A device is accepted when its fastboot answers getvar:product with the project GammaOS Pico's LK is
+built as for one of the consoles in models.py: "k85v1_64_kpa" (Konkr Pocket Advance) or
+"k68v1_64_block" (Konkr Pocket Block). getvar:version-gammaos-pico gives "<version> <commit>"; LKs
+built before that variable existed answer FAIL and are still GammaOS Pico, with an unknown version.
+A stock LK ("k85v1_64", shared with other MT6785 handhelds, or "m8695_bw01") is refused: the first
+install is made with the flash package.
 """
 
 from __future__ import annotations
@@ -13,18 +15,17 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from .errors import ConsoleCancelled, ConsoleError, ConsoleTooOld, TOO_OLD_TO_READ
 from .fastboot import FastbootFail, FastbootSession, LinkError, ProtocolError, READ_TIMEOUT_MS
+from .models import ANY_NAME, DEFAULT, KPA, ConsoleModel, by_pico_product, by_stock_product
 from .usb import Candidate, UsbBus
 
 Progress = Callable[[Optional[float], str], None]
 
-PICO_PRODUCT = "k85v1_64_kpa"
-STOCK_PRODUCT = "k85v1_64"
-LK_PARTITIONS = ("lk_a", "lk_b")
+LK_PARTITIONS = ("lk_a", "lk_b")       # every LK copy that can be read; models.py says which are written
 BOOTLOADER_HINT = "hold SELECT + START + R while turning it on"
 
 
@@ -34,6 +35,7 @@ class ConsoleLink:
     ident: str                 # stable id of this console (fastboot serialno)
     label: str                 # for the UI
     lk_version: Optional[str]  # "1.0.0 abc1234" when GammaOS Pico answers getvar, else None
+    model: ConsoleModel = field(default=DEFAULT)   # which console it is (from getvar:product)
 
 
 # ---- the bus in use (tests swap in a fake one) ----
@@ -132,31 +134,40 @@ _in_use: Dict[str, ConsoleLink] = {}       # bus key -> link, while an operation
 _ident_where: Dict[str, str] = {}          # ident -> last bus key it was seen at
 
 
-def make_label(version: Optional[str]) -> str:
+def make_label(version: Optional[str], model: ConsoleModel = DEFAULT) -> str:
     if version:
-        return "Konkr Pocket Advance (GammaOS Pico %s, fastboot)" % version.split(" ", 1)[0]
-    return "Konkr Pocket Advance (GammaOS Pico, older than 1.0.0, fastboot)"
+        return "%s (GammaOS Pico %s, fastboot)" % (model.name, version.split(" ", 1)[0])
+    return "%s (GammaOS Pico, older than 1.0.0, fastboot)" % model.name
+
+
+def stock_console_text(model: ConsoleModel) -> str:
+    return ("A %s with the stock bootloader is connected; install GammaOS Pico on it the first time with "
+            "the flash package %s and SP Flash Tool v5 (see the wiki's Installing page)."
+            % (model.name if model is not KPA else "console", model.flash_package))
 
 
 def identify(session: FastbootSession) -> Tuple[Optional[ConsoleLink], Optional[str]]:
     """Ask a fastboot device who it is. Returns (link, None) or (None, why it is refused)."""
     product = session.getvar_or_none("product")
     if product is None:
-        return None, "A fastboot device is connected, but it is not a Konkr Pocket Advance running GammaOS Pico."
+        return None, "A fastboot device is connected, but it is not a %s running GammaOS Pico." % ANY_NAME
     product = product.strip()
-    if product == STOCK_PRODUCT:
-        return None, ("A console with the stock bootloader is connected; install GammaOS Pico on it the first "
-                      "time with the flash package (see the wiki's Installing page).")
-    if product != PICO_PRODUCT:
-        return None, ("A fastboot device (%s) is connected, but it is not a Konkr Pocket Advance running "
-                      "GammaOS Pico." % (product or "unnamed"))
+    stock = by_stock_product(product)
+    if stock is not None:
+        # "k85v1_64" is also other MT6785 handhelds' stock name, so the Pocket Advance one says "console"
+        return None, stock_console_text(stock)
+    model = by_pico_product(product)
+    if model is None:
+        return None, ("A fastboot device (%s) is connected, but it is not a %s running GammaOS Pico."
+                      % (product or "unnamed", ANY_NAME))
     serial = (session.getvar_or_none("serialno") or "").strip()
     if not serial or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", serial):
         return None, "The console did not report a usable serial number; restart it into its bootloader and try again."
     version = session.getvar_or_none("version-gammaos-pico")
     if version is not None:
         version = version.strip() or None
-    return ConsoleLink(kind="fastboot", ident=serial, label=make_label(version), lk_version=version), None
+    return ConsoleLink(kind="fastboot", ident=serial, label=make_label(version, model), lk_version=version,
+                       model=model), None
 
 
 def _probe(bus, cand: Candidate) -> Probe:
@@ -166,6 +177,7 @@ def _probe(bus, cand: Candidate) -> Probe:
         return Probe(cand.key, None, open_problem_text(exc.kind), False)
     session = FastbootSession(transport)
     try:
+        session.drain()
         link, why = identify(session)
     except LinkError as exc:
         return Probe(cand.key, None, open_problem_text(exc.kind), exc.kind not in ("busy", "access", "driver"))
@@ -293,13 +305,14 @@ def _claim(link: ConsoleLink) -> Tuple[str, FastbootSession]:
             continue
         session = FastbootSession(transport)
         try:
+            session.drain()
             serial = session.getvar_or_none("serialno")
             product = session.getvar_or_none("product")
         except (LinkError, ProtocolError) as exc:
             session.close()
             problems.append(link_error_text(exc) if isinstance(exc, LinkError) else protocol_error_text(exc))
             continue
-        if (serial or "").strip() != link.ident or (product or "").strip() != PICO_PRODUCT:
+        if (serial or "").strip() != link.ident or (product or "").strip() != link.model.pico_product:
             session.close()
             continue
         _ident_where[link.ident] = cand.key

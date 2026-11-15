@@ -122,3 +122,111 @@ def test_console_without_yes_is_refused(tmp_path, capsys, console, monkeypatch):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     rc, out, err = run(capsys, "console", "flash", "--zip", fz)
     assert rc == 1 and not console.state.writes
+
+
+def test_console_block_writes_lk_a_only(tmp_path, capsys, console):
+    from pico_tool import config
+    from pico_tool.console.models import BLOCK
+    console.state.model = BLOCK
+    console.state.lk = {"lk_a": console.stock_image(BLOCK), "lk_b": b"never written by the factory"}
+    fz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-block-1.0.2-flash.zip"), "1.0.2", console="block")
+    rc, out, err = run(capsys, "console", "detect")
+    assert rc == 0 and "Konkr Pocket Block" in out and "BLOCK0001" in out
+    assert config.Settings().get("console_model") == "block"          # remembered for the card's package
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
+    assert rc == 0, err
+    assert [p for p, _h in console.state.writes] == ["lk_a"]
+    assert console.state.lk["lk_b"] == b"never written by the factory"
+    (b,) = console.list_backups(console.state.backup_root)
+    assert b["model"] == "block" and "lk_b" not in b
+    rc, out, err = run(capsys, "console", "backups")
+    assert "Konkr Pocket Block" in out and "lk_b" not in out
+    rc, out, err = run(capsys, "console", "restore", b["path"], "--yes")
+    assert rc == 0 and console.state.lk["lk_a"].startswith(b"STOCKBLK")
+    rc, out, err = run(capsys, "console", "stock", "--zip", fz, "--yes")
+    assert rc == 0 and [p for p, _h in console.state.writes] == ["lk_a", "lk_a", "lk_a"]
+
+
+def test_console_refuses_the_other_consoles_package_and_backup(tmp_path, capsys, console):
+    from pico_tool.console.models import BLOCK
+    kpa_zip = pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.0.2-flash.zip"), "1.0.2")
+    kpa_backup = console.backup_lk(console.find_consoles()[0], console.state.backup_root,
+                                   __import__("threading").Event(), lambda f, m: None)
+    console.state.model = BLOCK
+    console.state.lk = {"lk_a": console.stock_image(BLOCK), "lk_b": b""}
+    rc, out, err = run(capsys, "console", "flash", "--zip", kpa_zip, "--yes")
+    assert rc == 1 and "gammaos-pico-block-<version>-flash.zip" in err
+    rc, out, err = run(capsys, "console", "restore", kpa_backup, "--yes")
+    assert rc == 1 and "Konkr Pocket Advance" in err
+    img = tmp_path / "kpa.img"
+    img.write_bytes(console.make_image())
+    rc, out, err = run(capsys, "console", "flash", "--image", str(img), "--yes")
+    assert rc == 1 and "not this Konkr Pocket Block" in err
+    assert not console.state.writes
+
+
+def test_setup_downloads_the_chosen_consoles_card(tmp_path, capsys, monkeypatch):
+    from pico_tool.release import github
+    picked = []
+    rel = github.parse_release({"tag_name": "v1.0.2", "assets": [
+        {"name": n, "browser_download_url": "https://x/" + n, "size": 1}
+        for n in ("gammaos-pico-kpa-1.0.2-sdcard.zip", "gammaos-pico-block-1.0.2-sdcard.zip", "SHA256SUMS")]})
+    monkeypatch.setattr(github, "latest", lambda timeout=20: rel)
+    monkeypatch.setattr(github, "fetch_sums", lambda r: {})
+    z = pkg.make_package(str(tmp_path / "p.zip"))
+
+    def download(asset, sums, progress=None, cancel=None, dest_dir=None):
+        picked.append(asset.name)
+        return z
+    monkeypatch.setattr(github, "download", download)
+    (tmp_path / "card").mkdir()
+    assert run(capsys, "setup", str(tmp_path / "card"), "--dry-run")[0] == 0
+    assert run(capsys, "setup", str(tmp_path / "card"), "--dry-run", "--console", "block")[0] == 0
+    from pico_tool import config
+    config.Settings().set("console_model", "block")
+    assert run(capsys, "update", str(tmp_path / "card"), "--dry-run")[0] == 0
+    assert picked == ["gammaos-pico-kpa-1.0.2-sdcard.zip", "gammaos-pico-block-1.0.2-sdcard.zip",
+                      "gammaos-pico-block-1.0.2-sdcard.zip"]
+
+
+def test_check_network_never_shows_the_builtin_access(capsys, monkeypatch):
+    from pico_tool import net
+    from pico_tool.scrape import scraper
+    secret = ("secretdevid42", "S3cr3tPassword", "secretsoft")
+    monkeypatch.setattr(scraper, "builtin_credentials", lambda: secret)
+    monkeypatch.setattr(net, "source", lambda: net.TRUSTSTORE)
+    monkeypatch.setattr(net, "passed_over", lambda: [])
+    seen = []
+
+    def probe(url, timeout=20, user_agent=""):
+        seen.append(url)
+        return True, False, "HTTP 403"
+    monkeypatch.setattr(net, "probe", probe)
+    rc, out, err = run(capsys, "check-network")
+    assert rc == 0
+    assert "the system's trust store" in out
+    assert "ScreenScraper (box art): reached (built-in access)" in out
+    for s in secret + ("devpassword", "devid", "screenscraper.fr"):
+        assert s not in out + err
+    assert all("?" not in u for u in seen)                           # no address with a query is sent
+
+    def failing(url, timeout=20, user_agent=""):
+        return False, True, "certificate verify failed for https://api.screenscraper.fr/x?devpassword=S3cr3tPassword"
+    monkeypatch.setattr(net, "probe", failing)
+    rc, out, err = run(capsys, "check-network")
+    assert rc == 1 and "secure connection failed" in out
+    for s in secret + ("devpassword", "://"):
+        assert s not in out + err
+
+
+def test_pick_among_several_consoles():
+    from pico_tool.console.models import BLOCK, KPA
+    a = fake.ConsoleLink("fastboot", "KPA1", "a", None, KPA)
+    b = fake.ConsoleLink("fastboot", "BLK1", "b", None, BLOCK)
+    assert cli._pick([a], None) is a
+    assert cli._pick([], None) is None
+    assert cli._pick([a, b], "BLK1") is b
+    assert cli._pick([a, b], "NOPE") is None
+    with pytest.raises(cli.CliError) as e:
+        cli._pick([a, b], None)
+    assert "--serial" in str(e.value) and "Konkr Pocket Block BLK1" in str(e.value)

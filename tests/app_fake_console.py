@@ -1,5 +1,9 @@
 """A stand-in for pico_tool.console with the contract's API, for the window's and the command line's
-console flows (no USB involved): one console on "fastboot", backups in a folder, writes recorded."""
+console flows (no USB involved): one console on "fastboot" (a Konkr Pocket Advance, or a Konkr
+Pocket Block with state.model = BLOCK), backups in a folder, writes recorded.
+
+Images: b"LKIMG:<kind>:<version>:" then b"block:" for a Pocket Block image (anything else is a
+Pocket Advance one); b"STOCKLK" (Pocket Advance) and b"STOCKBLK" (Pocket Block) are stock."""
 
 import hashlib
 import json
@@ -8,6 +12,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+from pico_tool.console import models
+from pico_tool.console.models import BLOCK, KPA, MODELS, ConsoleModel
 
 
 class ConsoleError(Exception):
@@ -20,6 +27,7 @@ class ConsoleLink:
     ident: str
     label: str
     lk_version: Optional[str]
+    model: ConsoleModel = KPA
 
 
 @dataclass
@@ -28,11 +36,13 @@ class LkImageInfo:
     version: Optional[str]
     size: int
     problems: List[str] = field(default_factory=list)
+    model: Optional[ConsoleModel] = None
 
 
 class State(object):
     def __init__(self):
         self.present = True
+        self.model = KPA
         self.lk = {"lk_a": b"STOCKLK" * 100, "lk_b": b"STOCKLK" * 100}
         self.writes = []
         self.backup_root = None
@@ -42,26 +52,40 @@ class State(object):
 state = State()
 
 
-def make_image(kind="gammaos-pico", version="1.0.0"):
-    return ("LKIMG:%s:%s:" % (kind, version)).encode() + b"\0" * 64
+def make_image(kind="gammaos-pico", version="1.0.0", model=KPA):
+    return ("LKIMG:%s:%s:" % (kind, version)).encode() + (b"block:" if model is BLOCK else b"") + b"\0" * 64
 
 
-def check_lk_image(data):
+def stock_image(model=KPA):
+    return (b"STOCKBLK" if model is BLOCK else b"STOCKLK") * 100
+
+
+def check_lk_image(data, model=None):
     if data.startswith(b"LKIMG:"):
-        _tag, kind, version, _rest = data.split(b":", 3)
-        return LkImageInfo(kind.decode(), version.decode() or None, len(data), [])
-    if data.startswith(b"STOCKLK"):
-        return LkImageInfo("stock", None, len(data), [])
-    return LkImageInfo("unknown", None, len(data), ["This is not a bootloader image for this console."])
+        _tag, kind, version, rest = data.split(b":", 3)
+        info = LkImageInfo(kind.decode(), version.decode() or None, len(data), [],
+                           BLOCK if rest.startswith(b"block:") else KPA)
+    elif data.startswith(b"STOCKBLK"):
+        info = LkImageInfo("stock", None, len(data), [], BLOCK)
+    elif data.startswith(b"STOCKLK"):
+        info = LkImageInfo("stock", None, len(data), [], KPA)
+    else:
+        return LkImageInfo("unknown", None, len(data), ["This is not a bootloader image for this console."])
+    if model is not None and info.model is not model:
+        info.problems.append("This bootloader is for the %s, not this %s." % (info.model.name, model.name))
+    return info
+
+
+IDENTS = {"kpa": "KPA0001", "block": "BLOCK0001"}
 
 
 def find_consoles():
     if not state.present:
         return []
     info = check_lk_image(state.lk["lk_a"])
-    return [ConsoleLink("fastboot", "KPA0001", "Konkr Pocket Advance (%s, fastboot)" %
-                        ("GammaOS Pico " + info.version if info.kind == "gammaos-pico" else "stock"),
-                        info.version if info.kind == "gammaos-pico" else None)]
+    return [ConsoleLink("fastboot", IDENTS[state.model.key], "%s (%s, fastboot)" %
+                        (state.model.name, "GammaOS Pico " + info.version if info.kind == "gammaos-pico" else "stock"),
+                        info.version if info.kind == "gammaos-pico" else None, state.model)]
 
 
 def wait_for_console(kinds, cancel, progress, timeout=None):
@@ -91,8 +115,8 @@ def backup_lk(link, dest_root, cancel, progress):
         n += 1
         d = os.path.join(dest_root, link.ident, "%s_%d" % (stamp, n))
     os.makedirs(d)
-    meta = {"ident": link.ident, "date": stamp, "tool": "test"}
-    for part in ("lk_a", "lk_b"):
+    meta = {"ident": link.ident, "date": stamp, "tool": "test", "model": link.model.key}
+    for part in link.model.partitions:
         progress(0.5 if part == "lk_a" else 1.0, "Reading %s" % part)
         data = state.lk[part]
         with open(os.path.join(d, part + ".img"), "wb") as f:
@@ -123,11 +147,30 @@ def list_backups(dest_root):
     return out
 
 
+def backup_model(entry):
+    return models.by_key(entry.get("model"))
+
+
+def read_backup(path, model=None):
+    with open(os.path.join(path, "backup.json")) as f:
+        meta = json.load(f)
+    made_from = backup_model(meta)
+    if model is not None and made_from is not model:
+        raise ConsoleError("The backup was made from a %s, not this %s." % (made_from.name, model.name))
+    out = {}
+    for part in made_from.partitions:
+        with open(os.path.join(path, part + ".img"), "rb") as f:
+            out[part] = f.read()
+        if hashlib.sha256(out[part]).hexdigest() != meta[part]["sha256"]:
+            raise ConsoleError("%s.img does not match backup.json: the backup is damaged." % part)
+    return out
+
+
 def write_lk(link, images, cancel, progress, verify=True):
-    if set(images) - {"lk_a", "lk_b"}:
-        raise ConsoleError("Only lk_a and lk_b can be written.")
+    if set(images) - set(link.model.partitions):
+        raise ConsoleError("Only %s can be written." % link.model.partitions_text)
     for part, data in images.items():
-        if check_lk_image(data).problems:
+        if check_lk_image(data, link.model).problems:
             raise ConsoleError("The image for %s is refused." % part)
     if cancel.is_set():
         raise ConsoleError("Cancelled before anything was written.")

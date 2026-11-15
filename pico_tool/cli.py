@@ -2,21 +2,25 @@
 
   gammaos-pico-tool cards                         the cards on this computer
   gammaos-pico-tool status CARD                   what is on a card, and the latest release
-  gammaos-pico-tool setup CARD [--zip Z] [--bios F] [--no-demo] [--yes] [--dry-run]
-  gammaos-pico-tool update CARD [--zip Z] [--demo] [--yes] [--dry-run]
+  gammaos-pico-tool setup CARD [--console kpa|block] [--zip Z] [--bios F] [--no-demo] [--yes] [--dry-run]
+  gammaos-pico-tool update CARD [--console kpa|block] [--zip Z] [--demo] [--yes] [--dry-run]
   gammaos-pico-tool bios CARD FILE [--force]
   gammaos-pico-tool scan CARD [--system S] [--missing] [--json]
   gammaos-pico-tool scrape CARD [--system S] [--game NAME] [--all] [--source ...] [--region R]
   gammaos-pico-tool art set CARD GAME IMAGE [--system S]
   gammaos-pico-tool art rm CARD GAME [--system S]
   gammaos-pico-tool console detect | drivers | backups
-  gammaos-pico-tool console backup [--dest DIR]
-  gammaos-pico-tool console flash [--zip FLASH_ZIP | --image LK_IMG | --latest] [--yes]
-  gammaos-pico-tool console restore BACKUP_DIR [--yes]
-  gammaos-pico-tool console stock [--zip FLASH_ZIP | --latest] [--yes]
+  gammaos-pico-tool console backup [--dest DIR] [--serial ID]
+  gammaos-pico-tool console flash [--zip FLASH_ZIP | --image LK_IMG | --latest] [--yes] [--serial ID]
+  gammaos-pico-tool console restore BACKUP_DIR [--yes] [--serial ID]
+  gammaos-pico-tool console stock [--zip FLASH_ZIP | --latest] [--yes] [--serial ID]
+  gammaos-pico-tool check-network                 can GitHub and ScreenScraper be reached securely
 
 CARD is the card's folder (a drive letter such as E:\\ on Windows, /Volumes/NAME on macOS, the mount
-point on Linux).
+point on Linux). The consoles are the Konkr Pocket Advance ("kpa") and the Konkr Pocket Block
+("block"): the console commands find out which one is connected, and setup and update download the
+card package of the console given with --console, or of the last one the tool saw (the Pocket
+Advance until then). Both consoles' card packages hold the same files.
 """
 
 import argparse
@@ -25,7 +29,7 @@ import os
 import sys
 import threading
 
-from . import __version__, WIKI_INSTALLING, config
+from . import __version__, REPO, WIKI_INSTALLING, config
 
 
 class CliError(Exception):
@@ -125,19 +129,36 @@ def cmd_status(a):
     return 0
 
 
+def _chosen_model(a=None):
+    """The console whose packages to download: --console, else the one the tool last saw."""
+    from .console import models
+    key = getattr(a, "console", None) or config.Settings().get("console_model")
+    return models.by_key(key)
+
+
+def _remember_model(link):
+    model = getattr(link, "model", None)
+    if model is not None:
+        s = config.Settings()
+        if s.get("console_model") != model.key:
+            s.set("console_model", model.key)
+
+
 def _get_package(a):
-    """The card package to use: --zip, or the latest release downloaded and checked."""
+    """The card package to use: --zip, or the latest release's for the console, downloaded and checked."""
     from .release import github
     if a.zip:
         checked, msg = github.verify_local(a.zip)
         _out("Package: %s (%s)" % (a.zip, msg))
         return a.zip
-    _out("Looking for the latest release...")
+    model = _chosen_model(a)
+    _out("Looking for the latest release for the %s..." % model.name)
     rel = github.latest()
     _out("Latest release: %s" % rel.version)
+    card = rel.card_for(model)
     sums = github.fetch_sums(rel)
-    _out("Downloading %s..." % rel.card.name)
-    path = github.download(rel.card, sums, progress=lambda d, t: _bar(d, t, rel.card.name))
+    _out("Downloading %s..." % card.name)
+    path = github.download(card, sums, progress=lambda d, t: _bar(d, t, card.name))
     _out("Checked against SHA256SUMS: %s" % path)
     return path
 
@@ -357,15 +378,33 @@ def _backup_root(a=None):
     return (getattr(a, "dest", None) or s.get("backup_root") or con.default_backup_root())
 
 
-def _wait(con):
-    links = con.find_consoles()
-    if links:
-        return links[0]
-    _out("Waiting for the console: hold SELECT + START + R while turning it on, then connect USB "
-         "(Ctrl+C to stop).")
+def _pick(links, serial):
+    """The console to work with: the one with --serial, or the only one connected."""
+    if serial:
+        for link in links:
+            if link.ident == serial:
+                return link
+        return None
+    if len(links) > 1:
+        raise CliError("%d consoles are connected (%s); say which one with --serial"
+                       % (len(links), ", ".join("%s %s" % (l.model.name, l.ident) for l in links)))
+    return links[0] if links else None
+
+
+def _wait(con, serial=None):
+    link = _pick(con.find_consoles(), serial)
+    if link:
+        return link
+    _out("Waiting for the console%s: hold SELECT + START + R while turning it on, then connect USB "
+         "(Ctrl+C to stop)." % ((" " + serial) if serial else ""))
     cancel = threading.Event()
     try:
-        return con.wait_for_console({"fastboot"}, cancel, _cprog)
+        while True:
+            found = con.wait_for_console({"fastboot"}, cancel, _cprog)
+            link = _pick(con.find_consoles(), serial) if serial else found
+            if link:
+                return link
+            cancel.wait(1.0)
     except KeyboardInterrupt:
         cancel.set()
         raise CliError("stopped")
@@ -383,8 +422,9 @@ def cmd_console(a):
             if not items:
                 _out("No backups in %s" % root)
             for b in items:
-                _out("%s  %s  lk_a %s, lk_b %s  %s" % (b.get("date"), b.get("ident"), _kind(b.get("lk_a")),
-                                                       _kind(b.get("lk_b")), b.get("path")))
+                model = _backup_model(con, b)
+                parts = ", ".join("%s %s" % (p, _kind(b.get(p))) for p in model.partitions)
+                _out("%s  %s  %s  %s  %s" % (b.get("date"), b.get("ident"), model.name, parts, b.get("path")))
             return 0
         if a.con_cmd == "detect":
             links = con.find_consoles()
@@ -394,20 +434,23 @@ def cmd_console(a):
                 return 1
             for l in links:
                 _out("%s  (id %s, bootloader %s)" % (l.label, l.ident, l.lk_version or "unknown"))
+            if len(links) == 1:
+                _remember_model(links[0])
             return 0
-        link = _wait(con)
-        _out("Found: %s" % link.label)
+        link = _wait(con, getattr(a, "serial", None))
+        _out("Found: %s (id %s)" % (link.label, link.ident))
+        _remember_model(link)
         root = _backup_root(a)
         cancel = threading.Event()
         if a.con_cmd == "backup":
             path = con.backup_lk(link, root, cancel, _cprog)
             _out("Backed up to %s" % path)
             return 0
-        images, what = _images_for(a, con)
+        images, what = _images_for(a, con, link)
         _out(WARNING_TEXT)
         if not _ensure_backup(con, link, root, cancel):
             return 1
-        if not _confirm("Write %s to lk_a and lk_b of this console?" % what, a.yes):
+        if not _confirm("Write %s to %s of this %s?" % (what, link.model.partitions_text, link.model.name), a.yes):
             return 1
         con.write_lk(link, images, cancel, _cprog, verify=True)
         _out("Done: %s is on the console. Restart it (hold Power) with the card in." % what)
@@ -439,58 +482,93 @@ def _ensure_backup(con, link, root, cancel):
     return True
 
 
-def _images_for(a, con):
+def _backup_model(con, entry):
+    if hasattr(con, "backup_model"):
+        return con.backup_model(entry)
+    from .console import models
+    return models.by_key(entry.get("model"))
+
+
+def _images_for(a, con, link):
+    """{partition: image} for the connected console (lk_a and lk_b, or lk_a alone on the Pocket
+    Block), and a few words for what it is. Anything for the other console is refused here."""
     from .release import flashpkg
+    model = link.model
     if a.con_cmd == "restore":
-        b = _read_backup_dir(a.backup)
-        return b, "the backup from %s" % a.backup
+        return con.read_backup(a.backup, model), "the backup from %s" % a.backup
     if getattr(a, "image", None):
         with open(a.image, "rb") as f:
             data = f.read()
-        info = con.check_lk_image(data)
+        info = con.check_lk_image(data, model)
         if info.problems:
             raise CliError("; ".join(info.problems))
-        return {"lk_a": data, "lk_b": data}, "%s (%s)" % (os.path.basename(a.image), info.kind)
-    zp = a.zip or _latest_flash()
-    imgs = flashpkg.read_images(zp)
+        return {p: data for p in model.partitions}, "%s (%s)" % (os.path.basename(a.image), info.kind)
+    zp = a.zip or _latest_flash(model)
+    imgs = flashpkg.read_images(zp, model)
     key = "stock" if a.con_cmd == "stock" else "gammaos"
     if key not in imgs:
         raise CliError("the flash package has no %s bootloader" % key)
-    info = con.check_lk_image(imgs[key])
+    info = con.check_lk_image(imgs[key], model)
     if info.problems:
         raise CliError("; ".join(info.problems))
     label = "the stock bootloader" if key == "stock" else "GammaOS Pico %s" % (info.version or imgs.get("version") or "")
-    return {"lk_a": imgs[key], "lk_b": imgs[key]}, label.strip()
+    return {p: imgs[key] for p in model.partitions}, label.strip()
 
 
-def _read_backup_dir(path):
-    out = {}
-    for part in ("lk_a", "lk_b"):
-        p = os.path.join(path, part + ".img")
-        if not os.path.isfile(p):
-            raise CliError("%s has no %s.img" % (path, part))
-        with open(p, "rb") as f:
-            out[part] = f.read()
-    meta = os.path.join(path, "backup.json")
-    if os.path.isfile(meta):
-        import hashlib
-        with open(meta, encoding="utf-8") as f:
-            info = json.load(f)
-        for part in ("lk_a", "lk_b"):
-            want = (info.get(part) or {}).get("sha256")
-            if want and hashlib.sha256(out[part]).hexdigest() != want:
-                raise CliError("%s.img does not match backup.json: the backup is damaged" % part)
-    return out
-
-
-def _latest_flash():
+def _latest_flash(model):
     from .release import github
     rel = github.latest()
-    if not rel.flash:
-        raise CliError("the latest release has no flash package")
+    flash = rel.flash_for(model)
     sums = github.fetch_sums(rel)
-    _out("Downloading %s..." % rel.flash.name)
-    return github.download(rel.flash, sums, progress=lambda d, t: _bar(d, t, rel.flash.name))
+    _out("Downloading %s..." % flash.name)
+    return github.download(flash, sums, progress=lambda d, t: _bar(d, t, flash.name))
+
+
+# ---- the network check ---------------------------------------------------------------------------
+
+NETWORK_CHECKS = (
+    ("github", "GitHub (releases)", "https://api.github.com/repos/%s/releases/latest" % REPO, True),
+    ("screenscraper", "ScreenScraper (box art)", "https://api.screenscraper.fr/api2/", False),
+)
+
+
+def cmd_check_network(a):
+    """Reach GitHub and ScreenScraper once each over HTTPS. Exit status 1 when a secure connection
+    fails its checks anywhere, or GitHub cannot be reached at all; a ScreenScraper that is down
+    (it often is) is reported but does not fail the check. Nothing about the built-in ScreenScraper
+    access is printed but whether this build has it, and no address with a query is ever sent."""
+    from . import net
+    from .scrape.scraper import builtin_credentials, redact
+    try:
+        source = net.source()
+    except RuntimeError as e:
+        _err(str(e))
+        return 1
+    _out("Certificates: %s" % net.SOURCE_TEXT.get(source, source))
+    for note in net.passed_over():
+        _out("              not used: %s" % redact(note))
+    failed = False
+    ua = "gammaos-pico-tool/" + __version__
+    for key, name, url, required in NETWORK_CHECKS:
+        reached, tls_problem, detail = net.probe(url, timeout=a.timeout, user_agent=ua)
+        access = ""
+        if key == "screenscraper":
+            # whether the access is there, never what it is
+            has = builtin_credentials() is not None
+            access = "; this build has its built-in access" if has else "; no built-in access in this build"
+            if reached:
+                detail = "built-in access" if has else "no built-in access in this build"
+                access = ""
+        label = "%-24s" % (name + ":")
+        if reached:
+            _out("%s reached (%s)" % (label, detail))
+        elif tls_problem:
+            _out("%s secure connection failed (%s)%s" % (label, redact(detail), access))
+            failed = True
+        else:
+            _out("%s not reached (%s)%s%s" % (label, redact(detail), "" if required else ", not counted", access))
+            failed = failed or required
+    return 1 if failed else 0
 
 
 # ---- the parser -----------------------------------------------------------------------------------
@@ -518,6 +596,9 @@ def build_parser():
         c.add_argument("--zip", help="a card package you downloaded (default: the latest release)")
         c.add_argument("--bios", help="also copy this Game Boy Advance BIOS to bios/gba_bios.bin")
         c.add_argument("--force", action="store_true", help="accept a BIOS of the right size but unknown md5")
+        c.add_argument("--console", choices=("kpa", "block"),
+                       help="whose card package to download: kpa (Konkr Pocket Advance) or block (Konkr Pocket "
+                            "Block); default: the console the tool last saw, else kpa. The files are the same")
         if name == "setup":
             c.add_argument("--no-demo", action="store_true", help="leave the demo games out")
         else:
@@ -563,33 +644,48 @@ def build_parser():
     s.add_argument("--system")
     c.set_defaults(func=cmd_art)
 
-    c = sub.add_parser("console", help="the console's bootloader over USB (fastboot)")
+    c = sub.add_parser("console", help="the console's bootloader over USB (fastboot): Konkr Pocket Advance or "
+                                       "Konkr Pocket Block, found out by itself")
     csub = c.add_subparsers(dest="con_cmd", metavar="ACTION")
     csub.required = True
     csub.add_parser("detect", help="find the console")
     csub.add_parser("drivers", help="USB setup help for this system")
     s = csub.add_parser("backups", help="list the bootloader backups")
     s.add_argument("--dest", help="the backup folder")
-    s = csub.add_parser("backup", help="back up lk_a and lk_b")
+    s = csub.add_parser("backup", help="back up the bootloader (lk_a and lk_b; lk_a on the Pocket Block)")
     s.add_argument("--dest", help="the backup folder")
+    s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
     s = csub.add_parser("flash", help="install or update GammaOS Pico's bootloader")
     g = s.add_mutually_exclusive_group()
-    g.add_argument("--zip", help="a flash package (gammaos-pico-kpa-<version>-flash.zip)")
+    g.add_argument("--zip", help="a flash package for the connected console (gammaos-pico-kpa-<version>-flash.zip "
+                                 "or gammaos-pico-block-<version>-flash.zip)")
     g.add_argument("--image", help="an LK image file")
     g.add_argument("--latest", action="store_true", help="the latest release (the default)")
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--dest", help="the backup folder")
+    s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
     s = csub.add_parser("restore", help="write a backup back")
     s.add_argument("backup", help="the backup's folder")
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--dest", help="the backup folder")
+    s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
     s = csub.add_parser("stock", help="put the stock bootloader back")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--zip", help="a flash package")
     g.add_argument("--latest", action="store_true")
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--dest", help="the backup folder")
+    s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
     c.set_defaults(func=cmd_console)
+
+    c = sub.add_parser("check-network",
+                       help="check that GitHub and ScreenScraper can be reached over HTTPS, and say where the "
+                            "certificates come from (the system's trust store, or the bundled certifi list)",
+                       description="Reach GitHub's release API and ScreenScraper once each. Exit status 1 when a "
+                                   "secure connection fails its certificate checks, or when GitHub cannot be "
+                                   "reached; ScreenScraper being down is reported but not counted.")
+    c.add_argument("--timeout", type=float, default=20.0, help="seconds to wait for each server (default 20)")
+    c.set_defaults(func=cmd_check_network)
     return p
 
 

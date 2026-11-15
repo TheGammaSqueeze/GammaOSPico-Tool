@@ -46,6 +46,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y xvfb p7zip-full zip
           xvfb-run -a python -m pytest -q
 
+      - name: Network tests
+        if: runner.os != 'Linux'
+        run: python -m pytest -q tests/test_net.py
+
       - name: Bake in built-in ScreenScraper credentials
         shell: bash
         env:
@@ -53,24 +57,58 @@ jobs:
         run: |
           if [ -n "$SS_DEVCREDS_GEN" ]; then
             python -c "import base64,os; open('pico_tool/scrape/_devcreds_gen.py','wb').write(base64.b64decode(os.environ['SS_DEVCREDS_GEN']))"
+            python -c "from pico_tool.scrape._devcreds import builtin_credentials as b; import sys; sys.exit(0 if b() else 1)" \
+              || { echo "SS_DEVCREDS_GEN does not hold a usable credentials module"; exit 1; }
             echo "baked built-in ScreenScraper credentials into the build"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "SS_DEVCREDS_GEN is missing: a release build must have the built-in ScreenScraper access"
+            exit 1
           else
             echo "no SS_DEVCREDS_GEN secret; building without built-in credentials (TheGamesDB with a user key still works)"
           fi
 
       - name: Build one-file binary
         shell: bash
-        run: >
-          pyinstaller --onefile --name gammaos-pico-tool --clean --noconfirm
-          --paths .
-          --hidden-import tkinter
-          --hidden-import PIL --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder
-          --hidden-import usb.backend.libusb1
-          --hidden-import libusb_package
-          --hidden-import importlib_resources
-          --collect-binaries libusb_package
-          --collect-submodules pico_tool
-          packaging/entry.py
+        run: |
+          extra=()
+          if [ -f pico_tool/scrape/_devcreds_gen.py ]; then
+            extra+=(--hidden-import pico_tool.scrape._devcreds_gen)
+          fi
+          pyinstaller --onefile --name gammaos-pico-tool --clean --noconfirm \
+            --paths . \
+            --hidden-import tkinter \
+            --hidden-import PIL --hidden-import PIL.ImageTk --hidden-import PIL._tkinter_finder \
+            --hidden-import usb.backend.libusb1 \
+            --hidden-import libusb_package \
+            --hidden-import importlib_resources \
+            --collect-binaries libusb_package \
+            --hidden-import truststore --collect-submodules truststore \
+            --hidden-import certifi --collect-data certifi \
+            --collect-submodules pico_tool \
+            "${extra[@]}" \
+            packaging/entry.py
+
+      # The person's computer does not have the CA paths this build machine's Python was compiled
+      # with. Pointing SSL_CERT_FILE and SSL_CERT_DIR at nothing recreates that here: the built binary
+      # must still reach GitHub over a checked HTTPS connection, or the build fails.
+      - name: Check HTTPS from the built binary
+        shell: bash
+        env:
+          SSL_CERT_FILE: ${{ runner.temp }}/no-such-ca-file.pem
+          SSL_CERT_DIR: ${{ runner.temp }}/no-such-ca-dir
+        run: |
+          "dist/${{ matrix.bin }}" check-network | tee network.txt
+          if [ -f pico_tool/scrape/_devcreds_gen.py ] && ! grep -q -e "(built-in access)" -e "has its built-in access" network.txt; then
+            echo "the built binary does not have its built-in ScreenScraper access"
+            exit 1
+          fi
+          mkdir -p empty-card
+          "dist/${{ matrix.bin }}" status empty-card | tee status.txt
+          grep -q "^Latest:" status.txt
+          if grep -qi -e "certificate" -e "SSL" status.txt; then
+            echo "the release check failed on a certificate problem"
+            exit 1
+          fi
 
       - name: Stage artifact
         shell: bash

@@ -69,6 +69,25 @@ def test_upload_never_swallows_the_okay(size):
     assert s.getvar("product") == "k85v1_64_kpa"
 
 
+@pytest.mark.parametrize("size", [1, 511, 512, 513, 65536, 0x100000, 0x100000 - 4])
+def test_upload_with_zero_length_packet_after_data(size):
+    """The Pocket Block's LK ends a data stream that fills its last packet with a zero length
+    packet before the OKAY: it is skipped, and the session stays in step."""
+    c, s = session_for(FakeConsole(console="block"))
+    c.staged = bytes((i * 5 + 1) & 0xFF for i in range(size))
+    assert s.upload() == c.staged
+    assert s.getvar("product") == "k68v1_64_block"
+
+
+def test_endless_zero_length_packets_are_refused():
+    c, s = session_for()
+    for _ in range(10):
+        c.out.append(b"")
+    with pytest.raises(ProtocolError):
+        s.run("getvar:product")
+    assert s.broken
+
+
 def test_upload_nothing_staged():
     c, s = session_for()
     with pytest.raises(FastbootFail):

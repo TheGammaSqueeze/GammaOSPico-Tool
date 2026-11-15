@@ -28,7 +28,8 @@ def test_backup_round_trip(bus, tmp_path):
     assert os.path.dirname(folder) == os.path.join(str(tmp_path), link.ident)
     assert sorted(os.listdir(folder)) == ["backup.json", "lk_a.img", "lk_b.img"]
     record = json.load(open(os.path.join(folder, "backup.json")))
-    assert set(record) == {"ident", "date", "lk_a", "lk_b", "tool"}
+    assert set(record) == {"ident", "date", "model", "lk_a", "lk_b", "tool"}
+    assert record["model"] == "kpa"
     assert record["ident"] == link.ident
     assert record["date"].endswith("Z")
     for name, kind in (("lk_a", "gammaos-pico"), ("lk_b", "stock")):

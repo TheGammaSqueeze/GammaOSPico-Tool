@@ -66,6 +66,9 @@ class Page(object):
     def on_card(self):
         """The chosen card changed (or its contents)."""
 
+    def on_console_model(self):
+        """The person's console changed (picked in Settings or the Card tab, or seen on USB)."""
+
 
 class App(object):
     def __init__(self, root=None, settings=None):
@@ -397,6 +400,20 @@ class App(object):
         for p in self.pages:
             if p.built:
                 p.on_card()
+
+    def console_model(self):
+        """The person's console (models.ConsoleModel): the one picked or last seen, the Pocket
+        Advance until then. It chooses which console's packages are downloaded."""
+        from ..console.models import by_key
+        return by_key(self.settings.get("console_model"))
+
+    def set_console_model(self, model):
+        if model is None or self.settings.get("console_model") == model.key:
+            return
+        self.settings.set("console_model", model.key)
+        for p in self.pages:
+            if p.built:
+                p.on_console_model()
 
     def quit(self):
         try:

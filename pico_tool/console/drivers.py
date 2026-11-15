@@ -8,7 +8,7 @@ from .usb import KPA_PID, KPA_VID
 
 UDEV_RULE_FILE = "/etc/udev/rules.d/51-gammaos-pico.rules"
 UDEV_RULE = (
-    '# GammaOS Pico bootloader (fastboot) on the Konkr Pocket Advance\n'
+    '# GammaOS Pico bootloader (fastboot) on the Konkr Pocket Advance and the Konkr Pocket Block\n'
     'SUBSYSTEM=="usb", ATTR{idVendor}=="%04x", ATTR{idProduct}=="%04x", MODE="0660", '
     'GROUP="plugdev", TAG+="uaccess"\n' % (KPA_VID, KPA_PID)
 )

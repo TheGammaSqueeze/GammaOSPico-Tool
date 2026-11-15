@@ -1,8 +1,11 @@
 """The latest GammaOS Pico release from GitHub, and its files downloaded and checked.
 
-Uses only the standard library (urllib, so the system's proxy settings apply). Every release has
-gammaos-pico-kpa-<version>-sdcard.zip, gammaos-pico-kpa-<version>-flash.zip and SHA256SUMS; a
-download is kept in the tool's cache folder and checked against SHA256SUMS before it is used.
+Requests go through pico_tool.net (urllib with the tool's TLS setup, so the system's proxy settings
+apply). A release has, for each console it supports, gammaos-pico-<console>-<version>-sdcard.zip
+and gammaos-pico-<console>-<version>-flash.zip (<console> is "kpa" for the Konkr Pocket Advance,
+"block" for the Konkr Pocket Block), and one SHA256SUMS for all of them. Releases before 1.0.2
+have the Pocket Advance's packages only. A download is kept in the tool's cache folder and checked
+against SHA256SUMS before it is used.
 """
 
 import hashlib
@@ -14,13 +17,17 @@ import time
 import urllib.error
 import urllib.request
 
-from .. import REPO, __version__
+from .. import REPO, __version__, net
 from ..config import cache_dir
+from ..console.models import DEFAULT, MODELS
 
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % REPO
 UA = "gammaos-pico-tool/" + __version__
-CARD_RE = re.compile(r"^gammaos-pico-kpa-(.+)-sdcard\.zip$")
-FLASH_RE = re.compile(r"^gammaos-pico-kpa-(.+)-flash\.zip$")
+_PREFIXES = "|".join(re.escape(m.package_prefix) for m in MODELS)
+CARD_RE = re.compile(r"^(%s)-(.+)-sdcard\.zip$" % _PREFIXES)
+FLASH_RE = re.compile(r"^(%s)-(.+)-flash\.zip$" % _PREFIXES)
+TOOLS_RE = re.compile(r"^(%s)-windows-tools\.zip$" % _PREFIXES)
+_BY_PREFIX = {m.package_prefix: m for m in MODELS}
 
 
 class ReleaseError(Exception):
@@ -33,10 +40,34 @@ class Asset(object):
 
 
 class Release(object):
-    def __init__(self, tag, name, version, card, flash, sums, notes="", url="", published=""):
+    """cards, flashes and tools: {console key: Asset} for the consoles the release has packages for."""
+
+    def __init__(self, tag, name, version, cards, flashes, sums, notes="", url="", published="", tools=None):
         self.tag, self.name, self.version = tag, name, version
-        self.card, self.flash, self.sums = card, flash, sums
+        self.cards, self.flashes, self.sums = dict(cards), dict(flashes), sums
+        self.tools = dict(tools or {})
         self.notes, self.url, self.published = notes, url, published
+
+    def models(self):
+        """The consoles this release has a card package for."""
+        return [m for m in MODELS if m.key in self.cards]
+
+    def card_for(self, model=None):
+        """The card package for this console, or raises ReleaseError when the release has none."""
+        model = model or DEFAULT
+        asset = self.cards.get(model.key)
+        if asset is None:
+            raise ReleaseError("The release %s has no microSD card package for the %s."
+                               % (self.tag or self.version, model.name))
+        return asset
+
+    def flash_for(self, model=None):
+        model = model or DEFAULT
+        asset = self.flashes.get(model.key)
+        if asset is None:
+            raise ReleaseError("The release %s has no flash package for the %s."
+                               % (self.tag or self.version, model.name))
+        return asset
 
 
 def _open(url, timeout=30, accept=None):
@@ -48,7 +79,7 @@ def _open(url, timeout=30, accept=None):
     except ValueError:
         raise ReleaseError("The release lists a download address that cannot be used (%s)." % url)
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return net.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise ReleaseError("GammaOS Pico has no release on GitHub yet.")
@@ -67,6 +98,8 @@ def _open(url, timeout=30, accept=None):
         reason = getattr(e, "reason", e)
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise ReleaseError("GitHub did not answer in time. Check the connection and try again.")
+        if net.is_certificate_problem(reason):
+            raise ReleaseError("GitHub's certificate could not be checked (%s): %s." % (reason, net.CERTIFICATE_ADVICE))
         raise ReleaseError("GitHub could not be reached (%s). The tool works offline with a package you "
                            "downloaded before: \"Use a zip file...\"." % reason)
     except (socket.timeout, TimeoutError):
@@ -84,25 +117,32 @@ def latest(timeout=20):
 
 
 def parse_release(info):
-    card = flash = sums = None
+    cards, flashes, tools = {}, {}, {}
+    sums = None
     version = None
     for a in info.get("assets") or ():
         name = a.get("name") or ""
         asset = Asset(name, a.get("browser_download_url") or "", int(a.get("size") or 0))
         m = CARD_RE.match(name)
         if m:
-            card = asset
-            version = m.group(1)
-        elif FLASH_RE.match(name):
-            flash = asset
-            version = version or FLASH_RE.match(name).group(1)
+            cards[_BY_PREFIX[m.group(1)].key] = asset
+            version = version or m.group(2)
+            continue
+        m = FLASH_RE.match(name)
+        if m:
+            flashes[_BY_PREFIX[m.group(1)].key] = asset
+            version = version or m.group(2)
+            continue
+        m = TOOLS_RE.match(name)
+        if m:
+            tools[_BY_PREFIX[m.group(1)].key] = asset
         elif name == "SHA256SUMS":
             sums = asset
     tag = info.get("tag_name") or ""
-    if not card:
+    if not cards:
         raise ReleaseError("The latest release (%s) has no microSD card package." % (tag or "untitled"))
-    return Release(tag, info.get("name") or tag, version or tag.lstrip("v"), card, flash, sums,
-                   info.get("body") or "", info.get("html_url") or "", info.get("published_at") or "")
+    return Release(tag, info.get("name") or tag, version or tag.lstrip("v"), cards, flashes, sums,
+                   info.get("body") or "", info.get("html_url") or "", info.get("published_at") or "", tools)
 
 
 def parse_sums(text):

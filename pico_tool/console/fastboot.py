@@ -24,6 +24,9 @@ from typing import Callable, List, Optional
 
 COMMAND_MAX = 64          # longest command the protocol allows
 REPLY_MAX = 64            # longest status packet the device sends
+MAX_EMPTY_PACKETS = 4     # zero length packets skipped before a reply (end markers after data)
+DRAIN_TIMEOUT_MS = 50     # how long a new session waits for leftovers of an earlier one
+DRAIN_MAX_PACKETS = 64
 DEFAULT_TIMEOUT_MS = 5000
 FLASH_TIMEOUT_MS = 60000  # writing 2 MB to the eMMC takes well under a second; leave room
 READ_TIMEOUT_MS = 10000   # part-read stages 1 MB from the eMMC before it answers
@@ -104,6 +107,24 @@ class FastbootSession:
         except Exception:
             pass
 
+    def drain(self, timeout_ms: int = DRAIN_TIMEOUT_MS) -> int:
+        """Read and drop anything the device still holds from an earlier conversation: a reply that
+        conversation never read (it was cut short by an error or a closed program) stays queued in
+        the device and would otherwise answer this session's first command, putting every answer
+        after it one behind. Call it once, before the first command. Returns the packets dropped."""
+        dropped = 0
+        while dropped < DRAIN_MAX_PACKETS:
+            try:
+                self.t.recv(max(self.t.max_packet, REPLY_MAX), timeout_ms)
+            except LinkError as exc:
+                if exc.kind == "timeout":
+                    return dropped
+                self.broken = True
+                raise
+            dropped += 1
+        self.broken = True
+        raise ProtocolError("the device keeps sending data nobody asked for")
+
     # -- the core exchange --
 
     def _send_command(self, command: str, timeout_ms: int) -> None:
@@ -121,12 +142,19 @@ class FastbootSession:
     def _read_status(self, command: str, timeout_ms: int, on_info: InfoSink) -> Reply:
         """Read packets until OKAY, FAIL or DATA. INFO and TEXT lines are collected."""
         infos: List[str] = []
+        empty = 0
         while True:
             try:
                 pkt = self.t.recv(max(self.t.max_packet, REPLY_MAX), timeout_ms)
             except LinkError:
                 self.broken = True
                 raise
+            if not pkt and empty < MAX_EMPTY_PACKETS:
+                # a zero length packet: the end marker some LKs (the Pocket Block's) send after a
+                # data stream that filled its last packet exactly. It carries no reply; the reply
+                # follows it.
+                empty += 1
+                continue
             if len(pkt) < 4 or len(pkt) > REPLY_MAX:
                 self.broken = True
                 raise ProtocolError("unexpected %d byte reply to %s" % (len(pkt), command))

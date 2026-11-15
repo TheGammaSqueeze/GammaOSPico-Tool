@@ -27,8 +27,9 @@ class AboutPage(Page):
         widgets.label(t, ctx, APP_NAME, 24, weight="bold").pack(anchor="w")
         widgets.label(t, ctx, "Version %s" % __version__, 13, color=p.muted).pack(anchor="w")
         widgets.label(M, ctx, "Sets up and updates the microSD card of GammaOS Pico, the offline retro handheld OS "
-                      "for the Konkr Pocket Advance; lists the games the way the console does and puts box art "
-                      "on the card; and backs up, updates and restores the console's bootloader over USB.", 14,
+                      "for the Konkr Pocket Advance and the Konkr Pocket Block; lists the games the way the "
+                      "console does and puts box art on the card; and backs up, updates and restores the "
+                      "console's bootloader over USB.", 14,
                       wraplength=S(820)).pack(anchor="w", fill="x", pady=(S(22), S(8)))
         links = tk.Frame(M, bg=p.panel)
         links.pack(anchor="w", pady=(S(6), S(14)))

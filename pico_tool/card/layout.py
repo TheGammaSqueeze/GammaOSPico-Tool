@@ -1,9 +1,10 @@
 """The card's own files: what GammaOS Pico puts on it, and what belongs to the user.
 
-The package (gammaos-pico-kpa-<version>-sdcard.zip) brings gammaos/ (the menu, its themes and
-languages, boot.cfg), cores/, bios/README.txt, roms/<system>/ with free demo games and their box
-art, licences/ and README.txt (whose first line names the release). The console writes the rest:
-settings, play time, the recently played list, the archive index, saves and states.
+The package (gammaos-pico-kpa-<version>-sdcard.zip, or gammaos-pico-block-<version>-sdcard.zip with
+the same files) brings gammaos/ (the menu, its themes and languages, boot.cfg), cores/,
+bios/README.txt, roms/<system>/ with free demo games and their box art, licences/ and README.txt
+(whose first line names the release). The console writes the rest: settings, play time, the
+recently played list, the archive index, saves and states.
 """
 
 import hashlib

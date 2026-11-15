@@ -28,6 +28,7 @@ DEFAULTS = {
     "backup_root": "",
     "auto_refresh": True,
     "include_demo_games": True,
+    "console_model": "",        # "kpa" | "block": which console's packages to download ("" = kpa)
 }
 
 

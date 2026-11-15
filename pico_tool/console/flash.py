@@ -1,6 +1,9 @@
-"""Writing lk_a and lk_b over GammaOS Pico's fastboot, with a read back check.
+"""Writing the console's LK copies over GammaOS Pico's fastboot, with a read back check.
 
-Order: the copy the console is NOT running from goes first (getvar:current-slot), and is read
+Which copies: lk_a and lk_b on the Konkr Pocket Advance, lk_a alone on the Konkr Pocket Block (the
+factory never writes its _b copies and the preloader starts lk_a). See models.py.
+
+Order on the Pocket Advance: the copy the console is NOT running from goes first (getvar:current-slot), and is read
 back before the running copy is touched. If anything goes wrong with the first copy, the copy the
 console starts from is still the old, working one. Whether the preloader would fall back to the
 other copy when the one it starts from is bad is not known, so the messages never count on it.
@@ -12,11 +15,11 @@ import threading
 from typing import Callable, Dict, List, Optional
 
 from .backup import has_backup, operation_error, default_backup_root
-from .device import (ConsoleLink, LK_PARTITIONS, open_console, partition_size, read_partition,
-                     supports_part_read)
+from .device import ConsoleLink, open_console, partition_size, read_partition, supports_part_read
 from .errors import ConsoleCancelled, ConsoleError, ConsoleTooOld
 from .fastboot import FLASH_TIMEOUT_MS, FastbootFail, FastbootSession, LinkError, ProtocolError, sha256_hex
 from .lkimage import check_lk_image
+from .models import ConsoleModel
 
 Progress = Callable[[Optional[float], str], None]
 
@@ -31,14 +34,17 @@ def _write_order(names: List[str], current: Optional[str]) -> List[str]:
     return names
 
 
-def _other(name: str) -> str:
-    return "lk_b" if name == "lk_a" else "lk_a"
+def _other(name: str, model: ConsoleModel) -> Optional[str]:
+    """The other copy this console's bootloader is written to, or None when it has only one."""
+    others = [p for p in model.partitions if p != name]
+    return others[0] if others else None
 
 
 def write_lk(link: ConsoleLink, images: Dict[str, bytes], cancel: Optional[threading.Event],
              progress: Optional[Progress], verify: bool = True,
              backup_root: Optional[str] = None) -> Dict[str, str]:
-    """Write lk_a and/or lk_b. Every image must pass check_lk_image. Cancel is honoured only
+    """Write lk_a and/or lk_b (only those the console's model writes: lk_a alone on the Pocket
+    Block). Every image must pass check_lk_image for this console. Cancel is honoured only
     before the first byte is written. With verify, each copy is read back and compared by sha256.
 
     Returns {"lk_a": "verified" | "written", ...}; "written" means the LK could not read it back.
@@ -46,14 +52,19 @@ def write_lk(link: ConsoleLink, images: Dict[str, bytes], cancel: Optional[threa
     `backup_root` (default_backup_root() when None) already holds a backup of it."""
     if not isinstance(images, dict) or not images:
         raise ConsoleError("No bootloader image was given, so nothing was written.")
-    bad = [k for k in images if k not in LK_PARTITIONS]
+    model = link.model
+    bad = [k for k in images if k not in model.partitions]
     if bad:
-        raise ConsoleError("Only lk_a and lk_b can be written, not %s; nothing was written." % ", ".join(map(str, bad)))
+        if len(model.partitions) == 1:
+            raise ConsoleError("The %s's bootloader is written to %s only, not %s; nothing was written."
+                               % (model.name, model.partitions[0], ", ".join(map(str, bad))))
+        raise ConsoleError("Only %s can be written, not %s; nothing was written."
+                           % (model.partitions_text, ", ".join(map(str, bad))))
     for name in sorted(images):
         data = images[name]
         if not isinstance(data, (bytes, bytearray)):
             raise ConsoleError("The image for %s is not a file's contents; nothing was written." % name)
-        info = check_lk_image(bytes(data))
+        info = check_lk_image(bytes(data), model)
         if info.problems:
             raise ConsoleError("The image for %s cannot be written: %s Nothing was written."
                                % (name, info.problems[0].rstrip(".") + "."))
@@ -124,11 +135,11 @@ def write_lk(link: ConsoleLink, images: Dict[str, bytes], cancel: Optional[threa
                     results[name] = "verified"
                     continue
                 raise ConsoleError("The copy written to %s did not read back correctly; %s"
-                                   % (name, _where_things_stand(name, results, running)))
+                                   % (name, _where_things_stand(name, results, running, model)))
     except ConsoleError:
         raise
     except _WriteStepFailed as failed:
-        raise ConsoleError(_step_failed_text(failed, results, running)) from failed.cause
+        raise ConsoleError(_step_failed_text(failed, results, running, model)) from failed.cause
     except Exception as exc:
         raise operation_error(exc, "while writing the bootloader") from exc
 
@@ -169,15 +180,19 @@ def _write_one(session: FastbootSession, name: str, data: bytes, verify: bool, s
     return len(back) >= len(data) and sha256_hex(back[:len(data)]) == sha256_hex(data)
 
 
-def _where_things_stand(failed: str, results: Dict[str, str], running: Optional[str]) -> str:
+def _where_things_stand(failed: str, results: Dict[str, str], running: Optional[str],
+                        model: ConsoleModel) -> str:
     """The rest of the sentence after a copy failed: the state of the other copy and what to do.
 
     Only a copy the console starts from that was never touched is promised to work: whether the
     preloader falls back to the other copy when the one it starts from is bad is not known, so a
     good other copy is reported, not relied on."""
-    other = _other(failed)
-    recover = ("If the console does not start, install GammaOS Pico again with the flash package and "
-               "SP Flash Tool v5 (see the wiki's Installing page).")
+    other = _other(failed, model)
+    recover = ("If the console does not start, install GammaOS Pico again with the flash package (%s) and "
+               "SP Flash Tool v5 (see the wiki's Installing page)." % model.flash_package)
+    if other is None:
+        # one copy only (the Pocket Block): the console starts from the one that failed
+        return "Do not turn the console off: try the update again, or restore a backup. %s" % recover
     if other == running and other not in results:
         return ("%s was not touched, so the console still starts from it as before. Try the update again."
                 % other)
@@ -205,9 +220,10 @@ def _short_reason(exc: BaseException) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-def _step_failed_text(failed: _WriteStepFailed, results: Dict[str, str], running: Optional[str]) -> str:
+def _step_failed_text(failed: _WriteStepFailed, results: Dict[str, str], running: Optional[str],
+                      model: ConsoleModel) -> str:
     cause = failed.cause
-    state = _where_things_stand(failed.name, results, running)
+    state = _where_things_stand(failed.name, results, running, model)
     if isinstance(cause, FastbootFail) and "low power" in cause.text.lower():
         return ("The console's battery is too low to write safely, so %s was not written; %s Charge it first."
                 % (failed.name, state))

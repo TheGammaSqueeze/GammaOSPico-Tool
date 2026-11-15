@@ -3,7 +3,7 @@
 import zipfile
 
 
-def make_package(path, version="2026.12.01", top=True, extra=None, menu=b"MENU-NEW"):
+def make_package(path, version="2026.12.01", top=True, extra=None, menu=b"MENU-NEW", console="kpa"):
     files = {
         "README.txt": ("GammaOS Pico for the Konkr Pocket Advance: the microSD card, release %s (lk-mt6785 abc1234)\n\nCopy it.\n"
                        % version).encode(),
@@ -19,7 +19,7 @@ def make_package(path, version="2026.12.01", top=True, extra=None, menu=b"MENU-N
     }
     if extra:
         files.update(extra)
-    pre = "gammaos-pico-kpa-%s-sdcard/" % version if top else ""
+    pre = "gammaos-pico-%s-%s-sdcard/" % (console, version) if top else ""
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         if pre:
             z.writestr(zipfile.ZipInfo(pre), b"")
@@ -28,11 +28,18 @@ def make_package(path, version="2026.12.01", top=True, extra=None, menu=b"MENU-N
     return path
 
 
-def make_flash_package(path, version="2026.12.01", gammaos=b"LKIMG:gammaos-pico:1.0.0:" + b"\0" * 64,
-                       stock=b"STOCKLK" * 100, bad_sum=False):
+def make_flash_package(path, version="2026.12.01", gammaos=None, stock=None, bad_sum=False, console="kpa",
+                       top=True):
+    """console="block": the Konkr Pocket Block's package (lk_block_*.img, the MT6768 scatter)."""
     import hashlib
-    pre = "gammaos-pico-kpa-%s-flash/" % version
-    files = {"fastboot/lk_kpa_gammaos.img": gammaos, "fastboot/lk_kpa_stock.img": stock, "README.txt": b"flash"}
+    if gammaos is None:
+        gammaos = b"LKIMG:gammaos-pico:1.0.0:" + (b"block:" if console == "block" else b"") + b"\0" * 64
+    if stock is None:
+        stock = (b"STOCKBLK" if console == "block" else b"STOCKLK") * 100
+    pre = "gammaos-pico-%s-%s-flash/" % (console, version) if top else "renamed/"
+    scatter = "MT6768_Android_scatter.txt" if console == "block" else "MT6785_Android_scatter.txt"
+    files = {"fastboot/lk_%s_gammaos.img" % console: gammaos, "fastboot/lk_%s_stock.img" % console: stock,
+             "README.txt": b"flash", "spflash/gammaos/" + scatter: b"scatter", "spflash/stock/" + scatter: b"scatter"}
     sums = "".join("%s  ./%s\n" % (hashlib.sha256(d if not bad_sum else b"x").hexdigest(), n) for n, d in sorted(files.items()))
     with zipfile.ZipFile(path, "w") as z:
         for n, d in files.items():

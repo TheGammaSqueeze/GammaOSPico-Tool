@@ -1,4 +1,4 @@
-"""Checks on a Konkr Pocket Advance LK image before it is written to lk_a or lk_b.
+"""Checks on an LK image before it is written to a console's lk_a (and lk_b).
 
 A MediaTek LK image is a chain of parts. Each part starts with a 512 byte header:
 
@@ -14,17 +14,21 @@ A MediaTek LK image is a chain of parts. Each part starts with a 512 byte header
     0x40  u32  1 on the last part of the chain
     0x44  u32  alignment of the next part (16)
 
-The Konkr's lk partitions are 2 MB. Both the stock LK and GammaOS Pico's carry the same chain:
+The lk partitions of both consoles are 2 MB. The stock LKs and GammaOS Pico's carry the same chain:
 lk, cert1, cert2, lk_main_dtb, cert1, cert2. They are told apart by what the lk part's code says
 about itself:
 
   GammaOS Pico   the fastboot variable name "version-gammaos-pico" sits next to its value
                  "<VERSION> <commit>" (the makefile's PICO_VERSION and PICO_COMMIT), the build tag
-                 starts "k85v1_64_kpa-", and the menu's strings say "GammaOS Pico"
-  stock (Konkr)  build tag "k85v1_64-<commit>-<date>-<date>" and no GammaOS strings
+                 starts with the console's project ("k85v1_64_kpa-" on the Pocket Advance,
+                 "k68v1_64_block-" on the Pocket Block), and the menu's strings say "GammaOS Pico"
+  stock (Konkr)  build tag "k85v1_64-<commit>-<date>-<date>" (Pocket Advance) or
+                 "m8695_bw01-<commit>-<date>-<date>" (Pocket Block), and no GammaOS strings
 
-Both must carry the Konkr's display driver (st7123p_hd640_boe): the AYANEO Pocket Air Mini uses
-the same k85v1_64 board name with another panel, and its LK would leave this console dark.
+Which console an image is for comes from that project, and the image must also carry that
+console's display driver (st7123p_hd640_boe on the Pocket Advance, jd9168s_960x720 on the Pocket
+Block): the AYANEO Pocket Air Mini uses the same k85v1_64 board name with another panel, and its LK
+would leave a Pocket Advance dark. See models.py.
 """
 
 from __future__ import annotations
@@ -34,17 +38,16 @@ import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from .models import ANY_NAME, MODELS, ConsoleModel
+
 PART_MAGIC = 0x58881688
 EXT_MAGIC = 0x58891689
 HEADER_SIZE = 512
-LK_PARTITION_SIZE = 0x200000          # lk_a and lk_b, from the stock scatter
-KPA_PANEL_DRIVER = b"st7123p_hd640_boe_lcm_drv"
+LK_PARTITION_SIZE = max(m.lk_size for m in MODELS)   # lk_a and lk_b, from the stock scatters
 PICO_VAR_NAME = b"version-gammaos-pico\x00"
-PICO_PROJECT = b"k85v1_64_kpa"
-STOCK_PROJECT = b"k85v1_64"
 
-# <project>-<commit>-<commit date>-<build date>, the LK_VER_TAG every build of this tree carries
-_BUILD_TAG = re.compile(rb"(k85v1_64[A-Za-z0-9_]*)-([0-9a-f]{6,40})-(\d{14})-(\d{14})")
+# <project>-<commit>-<commit date>-<build date>, the LK_VER_TAG every LK of these consoles carries
+_BUILD_TAG = re.compile(rb"([A-Za-z][A-Za-z0-9_]{1,40})-([0-9a-f]{6,40})-(\d{14})-(\d{14})")
 _PICO_VERSION = re.compile(rb"\d+(?:\.\d+)+ [0-9a-f]{4,40}\+?")
 
 
@@ -54,6 +57,7 @@ class LkImageInfo:
     version: Optional[str]    # GammaOS Pico "<version> <commit>", the stock build tag, or None
     size: int
     problems: List[str] = field(default_factory=list)   # empty = OK to write
+    model: Optional[ConsoleModel] = None                 # the console it is for, once identified
 
 
 @dataclass
@@ -112,16 +116,27 @@ def _pico_version(payload: bytes) -> Optional[str]:
     return None
 
 
-def check_lk_image(data: bytes) -> LkImageInfo:
-    """Say what an LK image is and whether it is safe to write to this console's lk_a / lk_b."""
+def _model_for_project(project: Optional[bytes], pico: bool) -> Optional[ConsoleModel]:
+    if project is None:
+        return None
+    for m in MODELS:
+        if (project == m.pico_project) if pico else (project in m.stock_projects):
+            return m
+    return None
+
+
+def check_lk_image(data: bytes, model: Optional[ConsoleModel] = None) -> LkImageInfo:
+    """Say what an LK image is, which console it is for, and whether it is safe to write. With
+    `model` (the console it would be written to), an image for the other console is refused too."""
     size = len(data)
     info = LkImageInfo(kind="unknown", version=None, size=size)
     if size == 0:
         info.problems.append("The file is empty.")
         return info
-    if size > LK_PARTITION_SIZE:
+    limit = model.lk_size if model is not None else LK_PARTITION_SIZE
+    if size > limit:
         info.problems.append(
-            "The file is %d bytes, larger than the %d byte bootloader partition." % (size, LK_PARTITION_SIZE))
+            "The file is %d bytes, larger than the %d byte bootloader partition." % (size, limit))
 
     parts, problem = _walk_parts(data)
     if problem:
@@ -145,29 +160,36 @@ def check_lk_image(data: bytes) -> LkImageInfo:
     tag = _BUILD_TAG.search(payload)
     project = tag.group(1) if tag else None
     is_pico = PICO_VAR_NAME in payload or b"GammaOS Pico" in payload
-    has_panel = KPA_PANEL_DRIVER in payload
+    target = _model_for_project(project, is_pico)
 
-    # an LK for another console: wrong project for GammaOS Pico, or not this console's display
-    foreign = (not has_panel) or (is_pico and project is not None and project != PICO_PROJECT)
+    # an LK for another console: a project no console here has, or not that console's display
+    foreign = False
     if is_pico:
         info.kind = "gammaos-pico"
         info.version = _pico_version(payload)
-        if project is not None and project != PICO_PROJECT:
+        if project is not None and target is None:
+            foreign = True
             info.problems.append(
-                "This GammaOS bootloader was built for another console (%s), not the Konkr Pocket Advance."
-                % project.decode("ascii", "replace"))
-    elif project == STOCK_PROJECT:
+                "This GammaOS bootloader was built for another console (%s), not the %s."
+                % (project.decode("ascii", "replace"), ANY_NAME))
+    elif target is not None:
         info.kind = "stock"
         info.version = tag.group(0).decode("ascii")
     else:
-        info.problems.append("The image is neither GammaOS Pico nor the Konkr Pocket Advance's stock bootloader.")
+        info.problems.append("The image is neither GammaOS Pico nor the stock bootloader of the %s." % ANY_NAME)
 
     if info.kind != "unknown":
-        if not has_panel:
-            info.problems.append(
-                "This bootloader is for another console: it lacks the Konkr Pocket Advance's display driver.")
         if project is None:
             info.problems.append("The image carries no build tag, so it cannot be identified safely.")
-        if foreign:
+        if target is not None and target.panel_driver not in payload:
+            foreign = True
+            info.problems.append(
+                "This bootloader is for another console: it lacks the %s's display driver." % target.name)
+        if foreign or target is None:
             info.kind, info.version = "unknown", None
+        else:
+            info.model = target
+
+    if model is not None and info.model is not None and info.model is not model:
+        info.problems.append("This bootloader is for the %s, not this %s." % (info.model.name, model.name))
     return info

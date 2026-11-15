@@ -92,7 +92,8 @@ def open_package(zip_path):
     if not any(n.replace("\\", "/") == top + "gammaos/menu.pack" for n in names):
         z.close()
         raise InstallError("%s is not a GammaOS Pico microSD card package (it has no gammaos/menu.pack). "
-                           "Use gammaos-pico-kpa-<version>-sdcard.zip." % os.path.basename(zip_path))
+                           "Use gammaos-pico-kpa-<version>-sdcard.zip (Konkr Pocket Advance) or "
+                           "gammaos-pico-block-<version>-sdcard.zip (Konkr Pocket Block)." % os.path.basename(zip_path))
     return z, top
 
 

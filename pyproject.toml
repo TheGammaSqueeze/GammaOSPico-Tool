@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gammaos-pico-tool"
-version = "1.0.2"
-description = "Set up GammaOS Pico microSD cards, manage their box art, and back up or update the Konkr Pocket Advance's bootloader (window and command line)"
+version = "1.0.3"
+description = "Set up GammaOS Pico microSD cards, manage their box art, and back up or update the bootloader of the Konkr Pocket Advance and Konkr Pocket Block (window and command line)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "GPL-3.0-or-later" }
@@ -23,6 +23,10 @@ dependencies = [
     "pillow>=9",
     "pyusb>=1.2.1",
     "libusb-package>=1.0.26.1",
+    # HTTPS: the operating system's own trust store first (truststore needs Python 3.10 or later),
+    # certifi's bundle when that is not available (see pico_tool/net.py)
+    "truststore>=0.9; python_version >= '3.10'",
+    "certifi>=2024.2.2",
 ]
 
 [project.optional-dependencies]

@@ -157,3 +157,81 @@ def test_batch_stops_and_cancels(tmp_path):
     ev.set()
     out = batch.run(res.games, FakeScraper(), store.ArtIndex(str(tmp_path)), cancel=ev)
     assert out.cancelled and not out.done
+
+
+# ---- the built-in access and accounts never show in a message ----
+
+DEVID, DEVPW, SOFT = "secretdevid42", "S3cr3t+Pass/word", "secretsoft"
+
+
+def _ss():
+    return scraper.ScreenScraper(ssid="myuser", sspassword="mypass99", devid=DEVID, devpw=DEVPW, softname=SOFT)
+
+
+def _assert_clean(text):
+    for bad in (DEVID, DEVPW, SOFT, "S3cr3t%2BPass%2Fword", "mypass99", "devpassword=", "devid=", "sspassword=",
+                "screenscraper.fr/api2", "://"):
+        assert bad not in text, (bad, text)
+
+
+def _raising_urlopen(exc_for):
+    def urlopen(req, timeout=30):
+        raise exc_for(req.full_url)
+    return urlopen
+
+
+@pytest.mark.parametrize("exc_for", [
+    lambda url: __import__("urllib.error").error.URLError(OSError("refused while fetching %s" % url)),
+    lambda url: OSError("connection to %s reset" % url),
+    lambda url: __import__("http.client").client.InvalidURL("nonnumeric port: %s" % url),
+    lambda url: ValueError("unknown url type: %r" % url),
+    lambda url: __import__("urllib.error").error.URLError(
+        __import__("ssl").SSLCertVerificationError(1, "CERTIFICATE_VERIFY_FAILED for %s" % url)),
+])
+def test_network_failure_text_never_holds_credentials(monkeypatch, exc_for):
+    from pico_tool import net
+    monkeypatch.setattr(net, "urlopen", _raising_urlopen(exc_for))
+    sc = _ss()
+    with pytest.raises(scraper.ScrapeError) as e:
+        sc.match("Game", "Game.gba", BY_KEY["gba"], 0x1234, 10)
+    _assert_clean(str(e.value))
+
+
+def test_media_download_failure_never_holds_the_media_address(monkeypatch):
+    from pico_tool import net
+    media = "https://neoclone.screenscraper.fr/api2/mediaJeu.php?devid=%s&devpassword=%s&softname=%s&ssid=myuser" \
+            "&sspassword=mypass99&media=box-2D" % (DEVID, DEVPW, SOFT)
+    info = json.dumps({"response": {"jeu": {"id": "1", "noms": [{"region": "wor", "text": "G"}],
+                                            "medias": [{"type": "box-2D", "region": "wor", "url": media}]}}}).encode()
+
+    def urlopen(req, timeout=30):
+        if "jeuInfos" in req.full_url:
+            class R(io.BytesIO):
+                status = 200
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+            return R(info)
+        raise OSError("timed out reading %s" % req.full_url)
+    monkeypatch.setattr(net, "urlopen", urlopen)
+    with pytest.raises(scraper.ScrapeError) as e:
+        _ss().match("Game", "Game.gba", BY_KEY["gba"], 0x1234, 10)
+    _assert_clean(str(e.value))
+
+
+def test_server_text_quoted_in_a_message_is_redacted(monkeypatch):
+    echo = ("Erreur de login : devid=%s devpassword=%s" % (DEVID, DEVPW)).encode()
+    monkeypatch.setattr(scraper, "_get", fake_get({scraper.SS_INFO_URL: (200, echo)}))
+    with pytest.raises(scraper.StopScraping) as e:
+        _ss().match("Game", "Game.gba", BY_KEY["gba"], 0x1234, 10)
+    _assert_clean(str(e.value))
+    assert "login" in str(e.value)
+
+
+def test_redact():
+    text = scraper.redact("failed: https://api.screenscraper.fr/api2/x.php?devid=a&devpassword=bcd and bcd",
+                          ["bcd"])
+    assert text == "failed: api.screenscraper.fr and ***"

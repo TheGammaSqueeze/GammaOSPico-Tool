@@ -143,3 +143,65 @@ def test_accent_change_rebuilds(app):
     app.show_name("Settings")
     app.root.update()
     assert app.page.name == "Settings"
+
+
+def test_block_console_install_and_restore(app, tmp_path):
+    from pico_tool.console.models import BLOCK
+    fake.state.model = BLOCK
+    fake.state.lk = {"lk_a": fake.stock_image(BLOCK), "lk_b": b"left alone"}
+    app.show_name("Console")
+    cp = app.pages[2]
+    assert pump(app, lambda: cp.link is not None)
+    assert cp.link.model is BLOCK
+    assert pump(app, lambda: app.console_model() is BLOCK)          # remembered for the card's package
+    assert cp.first_model.get() == "block"
+    # a Pocket Advance package is refused before anything is written
+    kz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.0.2-flash.zip"), "1.0.2")
+    cp._flash_source = lambda which: ("file", kz)
+    told = len(app.answers["told"])
+    cp.do_install()
+    assert pump(app, lambda: not cp.busy and len(app.answers["told"]) > told)
+    assert "gammaos-pico-block-<version>-flash.zip" in app.answers["told"][-1][1]
+    assert fake.state.writes == []
+    # its own package: backed up first, then lk_a only
+    bz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-block-1.0.2-flash.zip"), "1.0.2", console="block")
+    cp._flash_source = lambda which: ("file", bz)
+    cp.do_install()
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 1)
+    assert [p for p, _h in fake.state.writes] == ["lk_a"] and fake.state.lk["lk_b"] == b"left alone"
+    (b,) = fake.list_backups(fake.state.backup_root)
+    assert b["model"] == "block"
+    assert pump(app, lambda: cp.backups)
+    app.answers["dialog"] = 0                                        # the restore dialog picks the first backup
+    cp.do_restore()
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 2)
+    assert fake.state.lk["lk_a"].startswith(b"STOCKBLK")
+
+
+def test_console_model_choice_is_shared(app):
+    from pico_tool.console.models import BLOCK, KPA
+    fake.state.present = False
+    assert app.console_model() is KPA
+    app.show_name("Settings")
+    sp = app.page
+    app.show_name("Console")
+    cp = app.page
+    assert "gammaos-pico-kpa-windows-tools.zip" in "".join(_texts(cp.first_box))
+    app.set_console_model(BLOCK)
+    app.root.update()
+    assert sp.model.get() == "block" and cp.first_model.get() == "block"
+    text = "".join(_texts(cp.first_box))
+    assert "gammaos-pico-block-windows-tools.zip" in text and "MT6768_Android_scatter.txt" in text
+    assert "only lk_a ticked" in text
+    assert app.settings.get("console_model") == "block"
+
+
+def _texts(w):
+    out = []
+    try:
+        out.append(str(w.cget("text")))
+    except Exception:
+        pass
+    for c in w.winfo_children():
+        out.extend(_texts(c))
+    return out

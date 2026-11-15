@@ -36,19 +36,32 @@ def _align(b: bytearray, n: int = 16) -> None:
         b.append(0)
 
 
+# what each console's LKs carry: (GammaOS Pico build tag, product, stock build tag, stock product, panel)
+CONSOLE_STRINGS = {
+    "kpa": (b"k85v1_64_kpa-abc1234-20261113124810-20261113125558", b"k85v1_64_kpa",
+            b"k85v1_64-5cd8ba07fef-20260730160432-20260730170410", b"k85v1_64",
+            b"st7123p_hd640_boe_lcm_drv"),
+    "block": (b"k68v1_64_block-e2c4639-20261115120246-20261115143046", b"k68v1_64_block",
+              b"m8695_bw01-99c2577f4a1-20261014113306-20261014163413", b"m8695_bw01",
+              b"jd9168s_960x720_dsi_vdo_m8695_bw01_drv"),
+}
+
+
 def make_lk_image(kind: str = "pico", version: Optional[str] = "1.0.0 abc1234", signed: bool = True,
                   dtb: bool = True, panel: bool = True, pad_to: Optional[int] = None,
-                  filler: int = 4096, seed: int = 1) -> bytes:
-    """A small image with the same part chain and identifying strings as a real one."""
+                  filler: int = 4096, seed: int = 1, console: str = "kpa") -> bytes:
+    """A small image with the same part chain and identifying strings as a real one, for the
+    Konkr Pocket Advance (console="kpa") or the Konkr Pocket Block (console="block")."""
+    pico_tag, pico_product, stock_tag, stock_product, panel_drv = CONSOLE_STRINGS[console]
     code = bytearray()
     code += bytes((seed * 7 + i) & 0xFF for i in range(filler))
     if kind == "pico":
-        code += b"\x00version-bootloader\x00\x00k85v1_64_kpa-abc1234-20261113124810-20261113125558\x00\x00"
+        code += b"\x00version-bootloader\x00\x00" + pico_tag + b"\x00\x00"
         if version is not None:
             code += b"version-gammaos-pico\x00\x00\x00\x00" + version.encode("ascii") + b"\x00\x00"
-        code += b"product\x00k85v1_64_kpa\x00\x00# GammaOS Pico boot mode for this card.\n\x00"
+        code += b"product\x00" + pico_product + b"\x00\x00# GammaOS Pico boot mode for this card.\n\x00"
     elif kind == "stock":
-        code += b"\x00k85v1_64-5cd8ba07fef-20260730160432-20260730170410\x00\x00product\x00k85v1_64\x00"
+        code += b"\x00" + stock_tag + b"\x00\x00product\x00" + stock_product + b"\x00"
     elif kind == "apm":   # same board name, another console's panel
         code += b"\x00k85v1_64-58d8ec45ef8-20251027204950-20251027210907\x00\x00st7703_hd720_lcm_drv\x00"
         panel = False
@@ -56,7 +69,7 @@ def make_lk_image(kind: str = "pico", version: Optional[str] = "1.0.0 abc1234", 
         code += b"\x00k85v1_64-f035f83-20260819025244-20260819135712\x00GammaOS Pico\x00"
         panel = False
     if panel:
-        code += b"st7123p_hd640_boe_lcm_drv\x00"
+        code += panel_drv + b"\x00"
     code += bytes(256)
 
     parts = [("lk", bytes(code), 0)]
@@ -80,9 +93,14 @@ def make_lk_image(kind: str = "pico", version: Optional[str] = "1.0.0 abc1234", 
 # ---- the device ----
 
 class FakeConsole:
-    def __init__(self, serial: str = "N7KBVK6D99ZD6HPB", product: str = "k85v1_64_kpa",
+    def __init__(self, serial: str = "N7KBVK6D99ZD6HPB", product: Optional[str] = None,
                  version: Optional[str] = "1.0.0 abc1234", part_read: bool = True,
-                 current_slot: str = "a", partition_size: int = 0x200000):
+                 current_slot: str = "a", partition_size: int = 0x200000, console: str = "kpa"):
+        """console="block" is a Konkr Pocket Block: product k68v1_64_block, its own LK images. It has
+        lk_b too (the factory never writes it), so the tests can see that the tool leaves it alone."""
+        if product is None:
+            product = CONSOLE_STRINGS[console][1].decode("ascii")
+        self.console = console
         self.vars: Dict[str, str] = {
             "product": product,
             "serialno": serial,
@@ -96,8 +114,8 @@ class FakeConsole:
             self.vars["version-gammaos-pico"] = version
         self.part_read = part_read
         self.partitions: Dict[str, bytearray] = {
-            "lk_a": bytearray(make_lk_image(seed=1, pad_to=partition_size)),
-            "lk_b": bytearray(make_lk_image(seed=1, pad_to=partition_size)),
+            "lk_a": bytearray(make_lk_image(seed=1, pad_to=partition_size, console=console)),
+            "lk_b": bytearray(make_lk_image(seed=1, pad_to=partition_size, console=console)),
         }
         self.download: Optional[bytes] = None
         self.staged = b""
@@ -115,6 +133,9 @@ class FakeConsole:
         self.corrupt_reads: Dict[str, int] = {}        # partition -> part-read calls left to corrupt (-1 = always)
         self.corrupt_flash: Dict[str, int] = {}        # partition -> flashes left that store damaged data
         self.short_upload = False                      # upload sends fewer bytes than announced
+        # the Pocket Block's LK ends a data stream that fills its last packet with a zero length
+        # packet before the OKAY; the Pocket Advance's does not
+        self.zlp_after_data = console == "block"
         self.low_battery = False
         self.flash_count: Dict[str, int] = {}
 
@@ -206,6 +227,8 @@ class FakeConsole:
             self._reply("DATA", "%08x" % len(self.staged))
             data = self.staged[:-100] if self.short_upload else self.staged
             self._emit(data)
+            if self.zlp_after_data and data and len(data) % PACKET == 0:
+                self.out.append(b"")
             if not self.short_upload:
                 self._reply("OKAY")
         else:
@@ -271,8 +294,9 @@ class FakeLink(Transport):
         return self.c.host_read(size)
 
     def close(self) -> None:
+        # what the device still had to send stays queued in it, as on real USB: the next session
+        # finds it first
         self.closed = True
-        self.c.out.clear()
         self.c.receiving = 0
 
 

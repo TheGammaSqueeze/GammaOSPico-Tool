@@ -170,3 +170,26 @@ def test_library_problem(bus, monkeypatch):
     with pytest.raises(ConsoleError) as e:
         wait_for_console({"fastboot"}, threading.Event(), no_progress, timeout=1)
     assert "USB library" in str(e.value)
+
+
+def test_stale_reply_from_an_earlier_session_is_dropped(bus):
+    """A reply an earlier program never read stays queued in the console; the next session must
+    not take it as the answer to its first command (every answer after it would be one behind)."""
+    c = FakeConsole()
+    c.out.append(b"OKAYk85v1_64_kpa")          # left over from a getvar nobody read
+    c.out.append(b"")                           # and a zero length end marker
+    bus.consoles.append(c)
+    (link,) = find_consoles()
+    assert link.ident == "N7KBVK6D99ZD6HPB" and link.lk_version == "1.0.0 abc1234"
+    c.out.append(b"OKAY")                       # again before an operation opens it
+    with device.open_console(link) as s:
+        assert s.getvar("serialno") == "N7KBVK6D99ZD6HPB"
+
+
+def test_console_that_never_stops_sending_is_refused(bus):
+    c = FakeConsole()
+    for _ in range(100):
+        c.out.append(b"INFOnoise")
+    bus.consoles.append(c)
+    report = scan()
+    assert report.links == [] and "did not expect" in report.problems[0]

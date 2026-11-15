@@ -1,7 +1,7 @@
 # GammaOS Pico Tool
 
-The all-in-one desktop tool for **GammaOS Pico** on the **Konkr Pocket Advance**, for Windows, macOS
-and Linux. It sets up and updates the microSD card, lists your games exactly the way the console
+The all-in-one desktop tool for **GammaOS Pico** on the **Konkr Pocket Advance** and the **Konkr
+Pocket Block**, for Windows, macOS and Linux. It sets up and updates the microSD card, lists your games exactly the way the console
 does and puts box art on the card, and backs up, updates and restores the console's bootloader.
 
 ![The Games tab](docs/screenshots/games.png)
@@ -10,10 +10,10 @@ does and puts box art on the card, and backs up, updates and restores the consol
 
 > [!CAUTION]
 > **GammaOS Pico is a custom bootloader, and this tool can write it. Both are experimental software,
-> provided as they are, with no warranty of any kind.** Writing a bootloader (`lk_a` and `lk_b`) can
-> leave a console that does not start, and you do it entirely at your own risk. Nobody involved is
-> responsible for a bricked or damaged console, lost data, or anything else that comes from using
-> them. The tool backs the console's bootloader up before its first write, but **nothing is
+> provided as they are, with no warranty of any kind.** Writing a bootloader (`lk_a` and `lk_b` on
+> the Pocket Advance, `lk_a` on the Pocket Block) can leave a console that does not start, and you
+> do it entirely at your own risk. Nobody involved is responsible for a bricked or damaged console,
+> lost data, or anything else that comes from using them. The tool backs the console's bootloader up before its first write, but **nothing is
 > guaranteed**.
 
 > [!WARNING]
@@ -53,10 +53,12 @@ the first time, right-click it and choose **Open**.
 - Warns when a card is not FAT32 or exFAT and links the wiki's
   [Installing](https://github.com/TheGammaSqueeze/GammaOSPico/wiki/Installing) page for
   formatting it. **The tool never formats a card.**
-- **Sets up a new card** or **updates one**: downloads the latest release's card package
-  (`gammaos-pico-kpa-<version>-sdcard.zip`), checks it against the release's `SHA256SUMS`, and
-  shows you every change before anything is written. A package you downloaded before works too
-  (offline).
+- **Sets up a new card** or **updates one**: downloads the latest release's card package for your
+  console (`gammaos-pico-kpa-<version>-sdcard.zip` for the Pocket Advance,
+  `gammaos-pico-block-<version>-sdcard.zip` for the Pocket Block; both hold the same files),
+  checks it against the release's `SHA256SUMS`, and shows you every change before anything is
+  written. Your console is picked on the Card tab or in Settings, and the tool remembers the one
+  it last saw on the Console tab. A package you downloaded before works too (offline).
 - An update **never replaces or deletes your files**: settings, `folders.txt`, play time, the
   recently played list, the archive index, saves, states, games, your BIOS, box art and
   `boot.cfg` all stay as they are. Each file is written whole (to a temporary file, flushed, then
@@ -92,26 +94,36 @@ the first time, right-click it and choose **Open**.
 ![The Console tab](docs/screenshots/console.png)
 
 Over GammaOS Pico's own bootloader (hold **SELECT + START + R** while turning the console on, then
-connect USB), the tool:
+connect USB), the tool finds out which console it is and:
 
-- **backs up** `lk_a` and `lk_b` to this computer (automatically before the first write to a
-  console it has no backup of),
+- **backs up** its bootloader to this computer: `lk_a` and `lk_b` on the Pocket Advance, `lk_a`
+  on the Pocket Block (automatically before the first write to a console it has no backup of),
 - **installs or updates** GammaOS Pico's bootloader from the latest release or a flash package or
   image you pick,
 - **restores a backup**, or **puts the stock bootloader back**.
 
-Every write asks first, is checked against the image and read back afterwards.
+Every write asks first, is checked against the image and read back afterwards. On the Pocket Block
+only `lk_a` is ever written (its `_b` copies are never used). A bootloader, flash package or backup
+made for one console is refused on the other.
 
 > [!NOTE]
-> The **first** install on a console with its stock bootloader is done with SP Flash Tool v5 (the
-> release's `gammaos-pico-kpa-windows-tools.zip` has it, with MediaTek's USB driver) and the flash
-> package (`gammaos-pico-kpa-<version>-flash.zip`), as the wiki's
+> The **first** install on a console with its stock bootloader is done with SP Flash Tool v5 and
+> the console's flash package, as the wiki's
 > [Installing](https://github.com/TheGammaSqueeze/GammaOSPico/wiki/Installing) page shows step by
-> step. The Console tab explains it and can save the flash package for you; from then on, the tool
+> step:
+>
+> | | Pocket Advance | Pocket Block |
+> |---|---|---|
+> | SP Flash Tool and MediaTek's USB driver | `gammaos-pico-kpa-windows-tools.zip` | `gammaos-pico-block-windows-tools.zip` |
+> | Flash package | `gammaos-pico-kpa-<version>-flash.zip` | `gammaos-pico-block-<version>-flash.zip` |
+> | Scatter file (in `spflash/gammaos/`) | `MT6785_Android_scatter.txt` | `MT6768_Android_scatter.txt` |
+> | Download Only, ticked | `lk_a` and `lk_b` | `lk_a` only |
+>
+> The Console tab explains it and can save the flash package for you; from then on, the tool
 > takes over.
 
-On Windows the console needs a WinUSB driver, and on Linux a udev rule: **USB setup help** on the
-Console tab shows what to do on your system.
+On Windows the console needs a WinUSB driver, and on Linux a udev rule (both consoles have the
+same USB ids): **USB setup help** on the Console tab shows what to do on your system.
 
 ## The command line
 
@@ -123,19 +135,28 @@ gammaos-pico-tool status E:\                             # what is on a card, an
 gammaos-pico-tool setup /media/me/GAMMAOS --yes          # put GammaOS Pico on a new card
 gammaos-pico-tool update /media/me/GAMMAOS --dry-run     # list what an update would change
 gammaos-pico-tool update /media/me/GAMMAOS --zip gammaos-pico-kpa-2026.12.01-sdcard.zip --yes
+gammaos-pico-tool setup /media/me/GAMMAOS --console block --yes   # the Pocket Block's card package
 gammaos-pico-tool bios /media/me/GAMMAOS gba_bios.bin
 gammaos-pico-tool scan /media/me/GAMMAOS --missing       # games without a cover (--json for scripts)
 gammaos-pico-tool scrape /media/me/GAMMAOS --system gba  # find the missing covers
 gammaos-pico-tool art set /media/me/GAMMAOS "Collie Defense" cover.png
 gammaos-pico-tool art rm /media/me/GAMMAOS "Collie Defense"
-gammaos-pico-tool console detect
+gammaos-pico-tool console detect                         # which console, and its bootloader
 gammaos-pico-tool console backup
 gammaos-pico-tool console flash --zip gammaos-pico-kpa-2026.12.01-flash.zip
+gammaos-pico-tool console flash --zip gammaos-pico-block-2026.12.01-flash.zip
 gammaos-pico-tool console restore "~/Documents/GammaOS Pico Backups/<console>/<date>"
 gammaos-pico-tool console stock
+gammaos-pico-tool check-network                          # can GitHub and ScreenScraper be reached securely
 ```
 
 `gammaos-pico-tool <command> --help` lists each command's options.
+
+`check-network` reaches GitHub and ScreenScraper once each over HTTPS and says where the
+certificates came from. It exits with status 1 when a secure connection fails its checks, or when
+GitHub cannot be reached. The tool checks certificates against the operating system's own trust
+store (Keychain on macOS, the Windows certificate store, the distribution's CA bundle on Linux),
+and against the certificate list it carries (certifi) when that is not available.
 
 ## More screenshots
 
@@ -161,12 +182,16 @@ cover). Its settings and caches stay on your computer, never on the card:
 
 ## Running from source
 
-Python 3.9 or later with Tkinter:
+Python 3.9 or later with Tkinter (3.10 or later to use the system's trust store through
+`truststore`; older versions use `certifi`'s list):
 
 ```sh
 pip install .
 gammaos-pico-tool
 ```
+
+Dependencies: `pillow`, `pyusb`, `libusb-package`, `truststore` (Python 3.10 and later) and
+`certifi`. The release binaries are built with PyInstaller as in `.github/workflows/release.yml`.
 
 Tests: `pip install pytest`, then `python -m pytest` (on a headless Linux, `xvfb-run -a python -m pytest`).
 With the [lk-mt6785](https://github.com/TheGammaSqueeze/lk-mt6785) sources next to it (or

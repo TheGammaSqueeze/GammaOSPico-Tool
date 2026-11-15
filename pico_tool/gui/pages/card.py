@@ -7,6 +7,7 @@ from tkinter import filedialog
 
 from ... import WIKI_INSTALLING
 from ...card import layout, volumes
+from ...console.models import MODELS, by_key
 from ...release import github, install
 from .. import images, theme, widgets
 from ..app import Page
@@ -147,6 +148,7 @@ class CardPage(Page):
         self.scroll.pack(fill="both", expand=True)
         self.detail = self.scroll.inner
         self.demo = tk.BooleanVar(value=bool(self.app.settings.get("include_demo_games")))
+        self.model_var = tk.StringVar(value=self.app.console_model().key)
         self.render_detail()
         self.app.root.after(200, self.refresh)
         self.check_release()
@@ -236,6 +238,10 @@ class CardPage(Page):
             self.cardlist.set(self.vols, self.app.card.path if self.app.card else None)
             self.render_detail()
 
+    def on_console_model(self):
+        if self.built and not self.busy:
+            self.render_detail()
+
     # ---- the latest release --------------------------------------------------------------------
     def check_release(self):
         self.rel_state = ("checking", None)
@@ -293,6 +299,16 @@ class CardPage(Page):
             tk.Frame(grid, bg=p.line, height=1).grid(row=r, column=0, columnspan=2, sticky="sew")
             row[0] += 1
 
+        # whose card package to download: the files are the same for both consoles, the name is not
+        r = row[0]
+        widgets.label(grid, ctx, "Console", 13, color=p.muted).grid(row=r, column=0, sticky="w", pady=S(7), padx=(0, S(24)))
+        self.model_var.set(self.app.console_model().key)
+        widgets.Select(grid, ctx, [(m.name, m.key) for m in MODELS], self.model_var,
+                       command=lambda *a: self.app.root.after_idle(
+                           lambda: self.app.set_console_model(by_key(self.model_var.get())))).grid(
+            row=r, column=1, sticky="w", pady=S(4))
+        tk.Frame(grid, bg=p.line, height=1).grid(row=r, column=0, columnspan=2, sticky="sew")
+        row[0] += 1
         fs_col = p.ink if v.fs_ok else p.danger
         item("File system", v.fs_label + ("" if v.fs_ok else "  (the console cannot read it)"), fs_col)
 
@@ -397,7 +413,8 @@ class CardPage(Page):
         zp = None
         if local:
             zp = filedialog.askopenfilename(parent=self.app.root, title="A GammaOS Pico card package",
-                                            filetypes=[("Card package", "gammaos-pico-kpa-*-sdcard.zip"),
+                                            filetypes=[("Card package", " ".join("%s-*-sdcard.zip" % m.package_prefix
+                                                                                 for m in MODELS)),
                                                        ("Zip files", "*.zip"), ("All files", "*")])
             if not zp:
                 return
@@ -406,6 +423,7 @@ class CardPage(Page):
         demo = bool(self.demo.get())
         root = v.path
         cancel = self.cancel
+        model = self.app.console_model()
 
         def work():
             if zp:
@@ -416,11 +434,12 @@ class CardPage(Page):
                 self.app.post(self._progress, None, "Looking for the latest release...")
                 rel = self.app.release or github.latest()
                 self.app.release = rel
+                card = rel.card_for(model)
                 sums = github.fetch_sums(rel)
-                path = github.download(rel.card, sums, cancel=cancel,
+                path = github.download(card, sums, cancel=cancel,
                                        progress=lambda d, t: self.app.post(
                                            self._progress, d / float(t) if t else None,
-                                           "Downloading %s  (%s of %s)" % (rel.card.name, human(d), human(t))))
+                                           "Downloading %s  (%s of %s)" % (card.name, human(d), human(t))))
             self.app.post(self._progress, None, "Comparing the package with the card...")
             return install.plan(path, root, demo_games=demo)
         self.app.run_bg(work, self._show_plan, self._failed, name="setup")

@@ -1,8 +1,7 @@
 """The Console tab: GammaOS Pico's bootloader over USB (fastboot) - back it up, install or update it,
-restore a backup or the stock bootloader."""
+restore a backup or the stock bootloader. The connected console says which it is (Konkr Pocket
+Advance or Konkr Pocket Block); what is read and written, and which packages fit, follow from that."""
 
-import hashlib
-import json
 import os
 import subprocess
 import sys
@@ -11,6 +10,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 from ... import WIKI_INSTALLING
+from ...console.models import MODELS, by_key
 from ...release import flashpkg, github
 from .. import images, theme, widgets
 from ..app import Page
@@ -81,20 +81,12 @@ class ConsolePage(Page):
             widgets.autowrap(widgets.label(r, ctx, t, 13, wraplength=S(300))).pack(side="left", padx=(S(12), 0),
                                                                                  fill="x", expand=True)
         widgets.PillButton(L, ctx, "USB setup help", self.drivers, "ghost", icon="usb", small=True).pack(anchor="w", pady=(S(10), 0))
-        first = widgets.Notice(L, ctx, "note", "Installing for the first time?",
-                               "A console with its stock bootloader has no fastboot this tool can use. The first "
-                               "time, GammaOS Pico goes on with SP Flash Tool v5 (V6 does not work), which the "
-                               "release has with MediaTek's USB driver in gammaos-pico-kpa-windows-tools.zip: load "
-                               "MT6785_Android_scatter.txt from the flash package's spflash/gammaos/, choose "
-                               "Download Only with only lk_a and lk_b ticked, then connect the powered-off "
-                               "console. The Installing page shows every step. From then on, this tab backs the "
-                               "bootloader up, updates it and puts the stock one back.")
-        first.pack(fill="x", pady=(S(18), 0))
-        links = tk.Frame(first.body.master, bg=p.note_wash)
-        links.pack(fill="x", pady=(S(8), 0))
-        widgets.Link(links, ctx, "Open the Installing page", WIKI_INSTALLING, bg=p.note_wash).pack(side="left")
-        widgets.PillButton(links, ctx, "Save the flash package...", self.save_flash_package, "ghost", icon="download",
-                           small=True, bg=p.note_wash).pack(side="right")
+        # the first install: the steps differ per console, and no console is known before one is
+        # connected, so the person picks theirs (the one last seen is picked already)
+        self.first_box = tk.Frame(L, bg=p.panel)
+        self.first_box.pack(fill="x", pady=(S(18), 0))
+        self.first_model = tk.StringVar(value=self.app.console_model().key)
+        self._render_first()
         # ---- right: what to do
         self.prog_frame = tk.Frame(self.right, bg=p.panel)
         self.prog_frame.pack(fill="x", side="bottom")
@@ -119,6 +111,35 @@ class ConsolePage(Page):
         self._render_found()
         self._render_actions()
         self.load_backups()
+
+    def _render_first(self):
+        ctx, p = self.ctx, self.pal
+        for w in self.first_box.winfo_children():
+            w.destroy()
+        model = by_key(self.first_model.get())
+        first = widgets.Notice(self.first_box, ctx, "note", "Installing for the first time?", first_install_text(model))
+        first.pack(fill="x")
+        pick = tk.Frame(first.body.master, bg=p.note_wash)
+        pick.pack(fill="x", pady=(S(8), 0))
+        for m in MODELS:
+            widgets.Radio(pick, ctx, m.name, self.first_model, m.key, bg=p.note_wash,
+                          command=lambda: self.app.root.after_idle(self._first_model_picked)).pack(anchor="w", pady=S(2))
+        links = tk.Frame(first.body.master, bg=p.note_wash)
+        links.pack(fill="x", pady=(S(8), 0))
+        widgets.Link(links, ctx, "Open the Installing page", WIKI_INSTALLING, bg=p.note_wash).pack(side="left")
+        widgets.PillButton(links, ctx, "Save the flash package...", self.save_flash_package, "ghost", icon="download",
+                           small=True, bg=p.note_wash).pack(side="right")
+
+    def _first_model_picked(self):
+        model = by_key(self.first_model.get())
+        if model is self.app.console_model():
+            self._render_first()
+        else:
+            self.app.set_console_model(model)       # comes back through on_console_model
+
+    def on_console_model(self):
+        self.first_model.set(self.app.console_model().key)
+        self._render_first()
 
     def panels(self, x, y, w, h):
         lw = max(S(330), min(S(430), int(w * 0.36)))
@@ -162,6 +183,8 @@ class ConsolePage(Page):
                     self.problems = probs
                     self._render_found()
                     self._render_actions()
+                if link is not None and getattr(link, "model", None) is not None:
+                    self.app.set_console_model(link.model)     # its packages from now on
 
             def fail(e):
                 pass
@@ -203,8 +226,12 @@ class ConsolePage(Page):
             w.destroy()
         ready = con is not None and self.link is not None and not self.busy
         rel = self.app.release
+        if self.link is not None:
+            copies = self.link.model.partitions_text
+        else:
+            copies = " or ".join("%s (%s)" % (m.partitions_text, m.name.replace("Konkr ", "")) for m in MODELS)
         rows = (
-            ("shield", "Back up the bootloader", "Saves lk_a and lk_b from the console to this computer.",
+            ("shield", "Back up the bootloader", "Saves %s from the console to this computer." % copies,
              "Back up", self.do_backup, "secondary"),
             ("download", "Install or update GammaOS Pico",
              "The bootloader from the latest release%s, or from a flash package or image you pick. A console "
@@ -238,16 +265,16 @@ class ConsolePage(Page):
         if not d:
             return
         self.app.status("Downloading the flash package...")
+        model = by_key(self.first_model.get())
 
         def work():
             rel = self.app.release or github.latest()
             self.app.release = rel
-            if not rel.flash:
-                raise github.ReleaseError("The latest release has no flash package.")
+            flash = rel.flash_for(model)
             sums = github.fetch_sums(rel)
-            path = github.download(rel.flash, sums, progress=lambda dn, t: self.app.post(
-                self.app.status, "Downloading %s (%s of %s)" % (rel.flash.name, human(dn), human(t))))
-            dest = os.path.join(d, rel.flash.name)
+            path = github.download(flash, sums, progress=lambda dn, t: self.app.post(
+                self.app.status, "Downloading %s (%s of %s)" % (flash.name, human(dn), human(t))))
+            dest = os.path.join(d, flash.name)
             shutil.copyfile(path, dest)
             return dest
 
@@ -298,9 +325,11 @@ class ConsolePage(Page):
                 tk.Label(r, image=images.icon("shield", S(18), p.muted), bg=p.panel).pack(side="left", anchor="n")
                 t = tk.Frame(r, bg=p.panel)
                 t.pack(side="left", padx=(S(10), 0), fill="x", expand=True)
-                widgets.label(t, ctx, "%s   \u00b7   console %s" % (b.get("date", "?"), b.get("ident", "?")), 12).pack(anchor="w")
-                widgets.label(t, ctx, "lk_a %s   lk_b %s" % (_kind(b.get("lk_a")), _kind(b.get("lk_b"))), 11,
-                              color=p.dim).pack(anchor="w")
+                model = _backup_model(b)
+                widgets.label(t, ctx, "%s   \u00b7   %s %s" % (b.get("date", "?"), model.name, b.get("ident", "?")),
+                              12).pack(anchor="w")
+                widgets.label(t, ctx, "   ".join("%s %s" % (part, _kind(b.get(part))) for part in model.partitions),
+                              11, color=p.dim).pack(anchor="w")
                 if b.get("ok") is False:
                     widgets.label(t, ctx, "Damaged: " + "; ".join(b.get("problems") or []), 11,
                                   color=p.danger, wraplength=S(400)).pack(anchor="w", fill="x")
@@ -362,13 +391,18 @@ class ConsolePage(Page):
         def done(path):
             self._busy(False)
             self.app.status("Backed up to %s" % path)
-            widgets.tell(self.app, "Backed up", "The console's bootloader (lk_a and lk_b) is saved in\n%s" % path)
+            widgets.tell(self.app, "Backed up", "The console's bootloader (%s) is saved in\n%s"
+                         % (link.model.partitions_text, path))
             self.load_backups()
         self.app.run_bg(lambda: con.backup_lk(link, root, cancel, self._prog_cb()), done, self._fail)
 
     def _confirm_write(self, what, extra=""):
-        return widgets.ask(self.app, "Write %s to the console?" % what,
-                           "Both bootloader slots (lk_a and lk_b) of %s get %s.%s" % (self.link.label, what, extra),
+        model = self.link.model
+        if len(model.partitions) > 1:
+            text = "Both bootloader slots (%s) of %s get %s.%s" % (model.partitions_text, self.link.label, what, extra)
+        else:
+            text = "The bootloader (%s) of %s gets %s.%s" % (model.partitions_text, self.link.label, what, extra)
+        return widgets.ask(self.app, "Write %s to the console?" % what, text,
                            "Write it", kind="danger", notice=("danger", "A bootloader write", RISKS),
                            confirm_text="I understand the risks, the console is charged and stays connected")
 
@@ -415,7 +449,9 @@ class ConsolePage(Page):
         d.add_button("Cancel", d.cancel)
         r = d.show()
         if r == "file":
-            types = [("Flash package", "gammaos-pico-kpa-*-flash.zip"), ("Zip files", "*.zip")]
+            prefixes = [self.link.model] if self.link is not None else list(MODELS)
+            types = [("Flash package", " ".join("%s-*-flash.zip" % m.package_prefix for m in prefixes)),
+                     ("Zip files", "*.zip")]
             if which == "gammaos":
                 types.append(("LK image", "*.img *.bin"))
             f = filedialog.askopenfilename(parent=self.app.root, title="A GammaOS Pico flash package",
@@ -428,26 +464,26 @@ class ConsolePage(Page):
         self._busy(True, "Getting the bootloader image...")
         cancel = threading.Event()
         self.cancel = cancel
+        model = self.link.model
 
         def work():
             kind, path = src
             if kind == "latest":
                 rel = self.app.release or github.latest()
                 self.app.release = rel
-                if not rel.flash:
-                    raise github.ReleaseError("The latest release has no flash package.")
+                flash = rel.flash_for(model)
                 sums = github.fetch_sums(rel)
-                path = github.download(rel.flash, sums, cancel=cancel, progress=lambda dn, t: self.app.post(
-                    self._progress, dn / float(t) if t else None, "Downloading %s (%s)" % (rel.flash.name, human(dn))))
+                path = github.download(flash, sums, cancel=cancel, progress=lambda dn, t: self.app.post(
+                    self._progress, dn / float(t) if t else None, "Downloading %s (%s)" % (flash.name, human(dn))))
             if path.lower().endswith(".zip"):
-                imgs = flashpkg.read_images(path)
+                imgs = flashpkg.read_images(path, model)
                 if which not in imgs:
                     raise flashpkg.FlashPackageError("This flash package has no %s bootloader." % which)
                 data = imgs[which]
             else:
                 with open(path, "rb") as f:
                     data = f.read()
-            info = con.check_lk_image(data)
+            info = con.check_lk_image(data, model)
             return data, info
 
         def ok(r):
@@ -478,7 +514,7 @@ class ConsolePage(Page):
         def go(data, info):
             what = "GammaOS Pico %s" % (info.version or "")
             if self._confirm_write(what.strip()):
-                self._write({"lk_a": data, "lk_b": data}, what.strip())
+                self._write({part: data for part in self.link.model.partitions}, what.strip())
         self._load_image(src, "gammaos", go)
 
     def do_stock(self):
@@ -490,7 +526,7 @@ class ConsolePage(Page):
 
         def go(data, info):
             if self._confirm_write("the stock bootloader", " GammaOS Pico then no longer starts, whatever is on the card."):
-                self._write({"lk_a": data, "lk_b": data}, "the stock bootloader")
+                self._write({part: data for part in self.link.model.partitions}, "the stock bootloader")
         self._load_image(src, "stock", go)
 
     def do_restore(self):
@@ -506,7 +542,8 @@ class ConsolePage(Page):
         lb.pack(fill="both", expand=True)
         for b in self.backups:
             mine = " (this console)" if b.get("ident") == self.link.ident else ""
-            lb.insert("end", "  %s   console %s%s   lk_a %s" % (b.get("date"), b.get("ident"), mine, _kind(b.get("lk_a"))))
+            lb.insert("end", "  %s   %s %s%s   lk_a %s" % (b.get("date"), _backup_model(b).name, b.get("ident"), mine,
+                                                         _kind(b.get("lk_a"))))
         lb.selection_set(0)
         d.add_button("Restore", lambda: d.done(lb.curselection()[0] if lb.curselection() else None), "primary")
         d.add_button("Cancel", d.cancel)
@@ -517,13 +554,19 @@ class ConsolePage(Page):
         if b.get("ok") is False:
             widgets.tell(self.app, "This backup cannot be used", "; ".join(b.get("problems") or ["it is damaged"]), "danger")
             return
+        model = self.link.model
+        if _backup_model(b) is not model:
+            widgets.tell(self.app, "This backup is for another console",
+                         "It was made from a %s, and this console is a %s; choose a backup of this console."
+                         % (_backup_model(b).name, model.name), "danger")
+            return
         try:
-            imgs = con.read_backup(b["path"]) if hasattr(con, "read_backup") else read_backup_folder(b["path"])
+            imgs = con.read_backup(b["path"], model)
         except (OSError, ValueError, con.ConsoleError) as e:
             widgets.tell(self.app, "This backup cannot be used", str(e), "danger")
             return
-        for part in ("lk_a", "lk_b"):
-            info = con.check_lk_image(imgs[part])
+        for part in sorted(imgs):
+            info = con.check_lk_image(imgs[part], model)
             if info.problems:
                 widgets.tell(self.app, "This backup is refused", "%s: %s" % (part, "; ".join(info.problems)), "danger")
                 return
@@ -534,21 +577,21 @@ class ConsolePage(Page):
             self._write(imgs, "the backup from %s" % b.get("date"))
 
 
-def read_backup_folder(path):
-    """lk_a.img and lk_b.img of a backup folder, checked against its backup.json."""
-    out = {}
-    for part in ("lk_a", "lk_b"):
-        with open(os.path.join(path, part + ".img"), "rb") as f:
-            out[part] = f.read()
-    meta = os.path.join(path, "backup.json")
-    if os.path.isfile(meta):
-        with open(meta, encoding="utf-8") as f:
-            info = json.load(f)
-        for part in ("lk_a", "lk_b"):
-            want = (info.get(part) or {}).get("sha256")
-            if want and hashlib.sha256(out[part]).hexdigest() != want:
-                raise ValueError("%s.img does not match backup.json: the backup is damaged." % part)
-    return out
+def first_install_text(model):
+    """How GammaOS Pico goes on a console with its stock bootloader the first time."""
+    copies = "only lk_a and lk_b" if len(model.partitions) > 1 else "only lk_a"
+    return ("A %s with its stock bootloader has no fastboot this tool can use. The first time, GammaOS Pico "
+            "goes on with SP Flash Tool v5 (V6 does not work), which the release has with MediaTek's USB driver "
+            "in %s: load %s from the flash package's spflash/gammaos/ (%s), choose Download Only with %s "
+            "ticked, then connect the powered-off console. The Installing page shows every step. From then "
+            "on, this tab backs the bootloader up, updates it and puts the stock one back."
+            % (model.name, model.windows_tools, model.scatter, model.flash_package, copies))
+
+
+def _backup_model(entry):
+    if con is not None and hasattr(con, "backup_model"):
+        return con.backup_model(entry)
+    return by_key(entry.get("model"))
 
 
 def _kind(part):

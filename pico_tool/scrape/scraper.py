@@ -1,4 +1,4 @@
-"""Scraper clients (standard library only): ScreenScraper and TheGamesDB.
+"""Scraper clients (urllib through pico_tool.net, nothing else): ScreenScraper and TheGamesDB.
 
 ScreenScraper.fr matches a ROM by its CRC32, size and file name (jeuInfos.php) and searches by
 words (jeuRecherche.php). GammaOS's developer account is built into release builds (see
@@ -15,14 +15,16 @@ Both have the same calls:
 """
 
 import html
+import http.client
 import json
+import re
 import socket
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from .. import __version__
+from .. import __version__, net
 from ._devcreds import builtin_credentials
 
 SS_INFO_URL = "https://api.screenscraper.fr/api2/jeuInfos.php"
@@ -63,7 +65,7 @@ class Result(object):
         self.matched = False
         self.title = ""
         self.image = None       # picture bytes
-        self.image_url = ""
+        self.image_url = ""     # where it came from: may carry credentials, never shown to anyone
         self.error = ""
 
 
@@ -82,13 +84,60 @@ def _sniff_image(data):
     return None
 
 
+# Query parameters that carry an account, a key or the built-in developer access. Their values, and
+# any whole address (ScreenScraper's media addresses carry the credentials in their query string),
+# never reach a message the person sees.
+SECRET_PARAMS = ("devid", "devpassword", "softname", "ssid", "sspassword", "apikey")
+_URL_RE = re.compile(r"(?i)\b(?:https?|ftp)://[^\s'\"<>)]*")
+_SECRET_QUERY_RE = re.compile(r"(?i)\b(%s)=[^&\s'\"<>)]*" % "|".join(SECRET_PARAMS))
+
+
+def _secrets_in(url, params=None):
+    """The secret values a request carries, in its params and in the url's own query string."""
+    pairs = list(params or [])
+    try:
+        pairs += urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query, keep_blank_values=False)
+    except ValueError:
+        pass
+    return [v for k, v in pairs if k.lower() in SECRET_PARAMS and v and len(str(v)) >= 3]
+
+
+def redact(text, secrets=()):
+    """text with every address cut down to its host, "devpassword=..." style pairs removed and the
+    given secret values replaced: safe to show."""
+    text = str(text)
+
+    def host_only(m):
+        try:
+            host = urllib.parse.urlsplit(m.group(0)).hostname
+        except ValueError:
+            host = None
+        return host or "the server"
+    text = _URL_RE.sub(host_only, text)
+    text = _SECRET_QUERY_RE.sub("***", text)
+    for value in sorted(set(str(v) for v in secrets if v), key=len, reverse=True):
+        text = text.replace(value, "***")
+        quoted = urllib.parse.quote_plus(value)
+        if quoted != value:
+            text = text.replace(quoted, "***")
+    return text
+
+
 def _get(url, params=None, timeout=30):
-    """(status, body bytes); network failures raise ScrapeError."""
+    """(status, body bytes); network failures raise ScrapeError, whose text never holds the address
+    or a credential."""
+    secrets = _secrets_in(url, params)
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+
+    def fail(text):
+        return ScrapeError(redact(text, secrets))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+    except ValueError:
+        raise ScrapeError("the server gave an address that cannot be used")
+    try:
+        with net.urlopen(req, timeout=timeout) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         try:
@@ -97,11 +146,19 @@ def _get(url, params=None, timeout=30):
             body = b""
         return e.code, body
     except urllib.error.URLError as e:
-        raise ScrapeError("the server could not be reached (%s)" % getattr(e, "reason", e))
+        reason = getattr(e, "reason", e)
+        if net.is_certificate_problem(reason):
+            raise fail("the server's certificate could not be checked (%s): %s" % (reason, net.CERTIFICATE_ADVICE))
+        raise fail("the server could not be reached (%s)" % reason)
     except (socket.timeout, TimeoutError):
         raise ScrapeError("the server did not answer in time")
+    except http.client.HTTPException as e:
+        # InvalidURL and friends can quote the address: name only the kind of failure
+        raise ScrapeError("the server's answer broke off (%s)" % e.__class__.__name__)
+    except ValueError:
+        raise ScrapeError("the server gave an address that cannot be used")
     except OSError as e:
-        raise ScrapeError("the connection failed (%s)" % e)
+        raise fail("the connection failed (%s)" % e)
 
 
 class ScreenScraper(object):
@@ -140,7 +197,17 @@ class ScreenScraper(object):
             p += [("ssid", self.ssid), ("sspassword", self.sspassword)]
         return p
 
+    def _secrets(self):
+        return [v for k, v in self._params() if k in SECRET_PARAMS]
+
     def _request(self, url, params):
+        try:
+            return self._request_raw(url, params)
+        except ScrapeError as e:
+            # the server's own text is quoted in some messages: it must not echo a credential
+            raise e.__class__(redact(str(e), self._secrets())) from None
+
+    def _request_raw(self, url, params):
         if not self.ready:
             raise StopScraping(self.unready_reason())
         status, body = _get(url, self._params() + params, self.timeout)
@@ -236,7 +303,10 @@ class ScreenScraper(object):
             res.error = "no cover"
             return res
         res.image_url = url
-        status, body = _get(url, timeout=max(self.timeout, 60))
+        try:
+            status, body = _get(url, timeout=max(self.timeout, 60))
+        except ScrapeError as e:
+            raise e.__class__(redact(str(e), self._secrets())) from None
         if status == 430:
             raise StopScraping("Your ScreenScraper quota for today is used up.")
         res.image = _sniff_image(body) if status == 200 else None

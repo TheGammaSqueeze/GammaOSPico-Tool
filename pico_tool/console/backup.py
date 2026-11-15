@@ -1,11 +1,15 @@
-"""Backups of lk_a and lk_b.
+"""Backups of the console's LK copies: lk_a and lk_b on the Konkr Pocket Advance, lk_a on the Konkr
+Pocket Block (the only copy that is ever written there; see models.py).
 
-Layout: <dest_root>/<ident>/<UTC yyyy-mm-dd_HHMMSS>/{lk_a.img, lk_b.img, backup.json}
+Layout: <dest_root>/<ident>/<UTC yyyy-mm-dd_HHMMSS>/{lk_a.img, lk_b.img (Pocket Advance), backup.json}
 
 backup.json:
-    {"ident": "<serialno>", "date": "<UTC ISO 8601>",
+    {"ident": "<serialno>", "date": "<UTC ISO 8601>", "model": "kpa" | "block",
      "lk_a": {"sha256": "...", "size": n, "kind": "...", "version": "..." or null},
-     "lk_b": {...}, "tool": "<tool version>"}
+     "lk_b": {...} (Pocket Advance only), "tool": "<tool version>"}
+
+Backups made before the tool knew more than one console have no "model": they are Pocket Advance
+backups.
 
 A backup is written into "<stamp>.partial" and renamed when complete, so a half written one never
 shows up in the list.
@@ -22,11 +26,12 @@ import sys
 import threading
 from typing import Callable, Dict, List, Optional
 
-from .device import (ConsoleLink, LK_PARTITIONS, link_error_text, open_console, partition_size,
-                     protocol_error_text, read_partition)
+from .device import (ConsoleLink, link_error_text, open_console, partition_size, protocol_error_text,
+                     read_partition)
 from .errors import ConsoleCancelled, ConsoleError, ConsoleTooOld
 from .fastboot import FastbootFail, LinkError, ProtocolError
 from .lkimage import check_lk_image
+from .models import KPA, ConsoleModel, by_key
 
 Progress = Callable[[Optional[float], str], None]
 
@@ -125,21 +130,28 @@ def _write_file(path: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+def backup_model(record) -> ConsoleModel:
+    """The console a backup (its backup.json, or a list_backups entry) was made from."""
+    key = record.get("model") if isinstance(record, dict) else None
+    return by_key(key, KPA) if key else KPA
+
+
 def _read_both(link: ConsoleLink, cancel, progress: Optional[Progress]) -> Dict[str, bytes]:
-    """Read lk_a and lk_b twice each and keep them only when both reads agree."""
+    """Read the console's LK copies twice each and keep them only when both reads agree."""
     images: Dict[str, bytes] = {}
-    passes = len(LK_PARTITIONS) * 2
+    names = link.model.partitions
+    passes = len(names) * 2
     step = [0]
 
     def report(done: int, total: int) -> None:
         if progress and total:
             frac = (step[0] + done / total) / passes * 0.9
-            name = LK_PARTITIONS[step[0] // 2]
+            name = names[step[0] // 2]
             word = "Reading" if step[0] % 2 == 0 else "Checking"
             progress(frac, "%s %s (%d of %d KB)." % (word, name, done // 1024, total // 1024))
 
     with open_console(link) as session:
-        for name in LK_PARTITIONS:
+        for name in names:
             expected = partition_size(session, name)
             first = read_partition(session, name, cancel=cancel, on_bytes=report)
             step[0] += 1
@@ -175,7 +187,8 @@ def operation_error(exc: BaseException, during: str) -> ConsoleError:
 
 def backup_lk(link: ConsoleLink, dest_root: str, cancel: Optional[threading.Event],
               progress: Optional[Progress]) -> str:
-    """Read lk_a and lk_b and save them with their checksums. Returns the backup folder."""
+    """Read the console's LK copies (lk_a and lk_b, or lk_a alone on the Pocket Block) and save them
+    with their checksums. Returns the backup folder."""
     if progress:
         progress(0.0, "Opening the console.")
     try:
@@ -196,12 +209,12 @@ def backup_lk(link: ConsoleLink, dest_root: str, cancel: Optional[threading.Even
     partial = final + ".partial"
     if progress:
         progress(0.92, "Saving the backup.")
-    record = {"ident": link.ident, "date": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    record = {"ident": link.ident, "date": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "model": link.model.key}
     try:
         os.makedirs(partial)
-        for name in LK_PARTITIONS:
+        for name in link.model.partitions:
             data = images[name]
-            info = check_lk_image(data)
+            info = check_lk_image(data, link.model)
             path = os.path.join(partial, name + ".img")
             _write_file(path, data)
             digest = _sha(data)
@@ -246,7 +259,10 @@ def _remove_tree(path: str) -> None:
 
 def _check_backup(folder: str, record: dict) -> List[str]:
     problems: List[str] = []
-    for name in LK_PARTITIONS:
+    key = record.get("model")
+    if key is not None and by_key(key, None) is None:
+        return ["The backup is of a console this version of the tool does not know (%s)." % key]
+    for name in backup_model(record).partitions:
         entry = record.get(name)
         if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
             problems.append("The backup has no record of %s." % name)
@@ -292,6 +308,7 @@ def list_backups(dest_root: str) -> List[dict]:
                 continue
             entry = dict(record)
             entry["path"] = folder
+            entry.setdefault("model", KPA.key)
             try:
                 entry["problems"] = _check_backup(folder, record)
             except OSError as exc:
@@ -307,16 +324,28 @@ def has_backup(dest_root: str, ident: str) -> bool:
     return any(b.get("ident") == ident and b.get("ok") for b in list_backups(dest_root))
 
 
-def read_backup(path: str) -> Dict[str, bytes]:
-    """Load a backup folder's lk_a and lk_b, checked against the recorded sha256, for write_lk."""
+def read_backup(path: str, model: Optional[ConsoleModel] = None) -> Dict[str, bytes]:
+    """Load a backup folder's LK copies (those of the console it was made from), checked against the
+    recorded sha256, for write_lk. With `model` (the console it would be written to), a backup of
+    the other console is refused."""
     try:
         with open(os.path.join(path, BACKUP_JSON), encoding="utf-8") as f:
             record = json.load(f)
     except (OSError, ValueError) as exc:
         raise ConsoleError("The backup in %s cannot be read (%s); choose another backup." % (path, exc)) from exc
+    if not isinstance(record, dict):
+        raise ConsoleError("The backup in %s cannot be read; choose another backup." % path)
+    key = record.get("model")
+    if key is not None and by_key(key, None) is None:
+        raise ConsoleError("The backup in %s is of a console this version of the tool does not know (%s); "
+                           "choose another backup." % (path, key))
+    made_from = backup_model(record)
+    if model is not None and made_from is not model:
+        raise ConsoleError("The backup in %s was made from a %s, not this %s; choose a backup of this console."
+                           % (path, made_from.name, model.name))
     images: Dict[str, bytes] = {}
-    for name in LK_PARTITIONS:
-        entry = record.get(name) if isinstance(record, dict) else None
+    for name in made_from.partitions:
+        entry = record.get(name)
         if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
             raise ConsoleError("The backup in %s has no record of %s; choose another backup." % (path, name))
         try:
