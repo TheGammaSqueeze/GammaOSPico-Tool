@@ -203,3 +203,75 @@ def test_bios_checks(tmp_path, monkeypatch):
     assert layout.check_bios(str(odd)).known
     dest = layout.install_bios(str(card), str(odd))
     assert dest.endswith(os.path.join("bios", "gba_bios.bin")) and layout.installed_bios(str(card)) == dest
+
+
+def test_a_write_the_card_lost_is_written_again(tmp_path, monkeypatch):
+    """The read-back after a write finds the card's copy wrong: written once more, then checked."""
+    card = tmp_path / "card"
+    card.mkdir()
+    p = install.plan(pkg.make_package(str(tmp_path / "p.zip")), str(card))
+    real = install._write_one
+    spoiled = {}
+
+    def write_once_badly(z, it, progress, state):
+        real(z, it, progress, state)
+        if it.rel == "gammaos/menu.pack" and not spoiled:
+            spoiled[it.rel] = True
+            with open(it.dest, "r+b") as f:      # the card kept something else
+                f.write(b"X")
+    monkeypatch.setattr(install, "_write_one", write_once_badly)
+    install.apply(p)
+    assert spoiled and tree(str(card))["gammaos/menu.pack"] == b"MENU-NEW"
+    assert p.verified == len([i for i in p.items if i.action in (install.NEW, install.REPLACE, install.SAME)])
+
+
+def test_a_file_that_never_lands_stops_the_update_with_its_name(tmp_path, monkeypatch):
+    card = tmp_path / "card"
+    card.mkdir()
+    p = install.plan(pkg.make_package(str(tmp_path / "p.zip")), str(card))
+    real = install._write_one
+
+    def always_bad(z, it, progress, state):
+        real(z, it, progress, state)
+        if it.rel == "gammaos/menu.pack":
+            with open(it.dest, "r+b") as f:
+                f.write(b"X")
+    monkeypatch.setattr(install, "_write_one", always_bad)
+    with pytest.raises(install.InstallError) as e:
+        install.apply(p)
+    assert "gammaos/menu.pack" in str(e.value) and "did not end up on the card" in str(e.value)
+
+
+def test_a_card_that_takes_no_writes_is_refused_before_anything(tmp_path, monkeypatch):
+    card = tmp_path / "card"
+    card.mkdir()
+    p = install.plan(pkg.make_package(str(tmp_path / "p.zip")), str(card))
+    real_open = open
+
+    def no_writes(path, mode="r", *a, **k):
+        if "w" in mode and str(path).startswith(str(card)):
+            raise PermissionError(13, "Read-only file system")
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr("builtins.open", no_writes)
+    with pytest.raises(install.InstallError) as e:
+        install.apply(p)
+    monkeypatch.undo()
+    assert "cannot be written" in str(e.value)
+    assert not any(os.scandir(str(card)))
+
+
+def test_a_file_changed_after_the_plan_is_put_right(tmp_path):
+    """The final check covers the files the plan found unchanged too."""
+    card = tmp_path / "card"
+    old = pkg.make_package(str(tmp_path / "old.zip"), "1.0.2", menu=b"MENU-OLD")
+    install.apply(install.plan(old, str(card.mkdir() or card)))
+    new = pkg.make_package(str(tmp_path / "new.zip"), "1.1.0")
+    p = install.plan(new, str(card))
+    same = [i for i in p.items if i.action == install.SAME and not i.rel.startswith("roms/")]
+    assert same
+    victim = same[0]
+    with open(victim.dest, "r+b") as f:          # changed between the plan and the write
+        f.write(b"Z")
+    install.apply(p)
+    with zipfile.ZipFile(new) as z:
+        assert open(victim.dest, "rb").read() == z.read(victim.info)

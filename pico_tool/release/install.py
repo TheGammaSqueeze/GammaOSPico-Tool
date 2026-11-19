@@ -9,7 +9,10 @@ The plan lists every file of the package and what happens to it on this card:
              boot.cfg...): never replaced, whatever the package holds
 
 Nothing on the card is ever deleted. Each file is written whole to "<name>.tmp", flushed to the card,
-then renamed over the old one, so a card pulled out halfway holds either the old file or the new. A
+then renamed over the old one, so a card pulled out halfway holds either the old file or the new.
+The card is checked to take writes before anything is written, every file written is read back
+from the card and compared with the package, and at the end the whole package is checked on the
+card again (see apply). A
 name in the zip that would land outside the card (an absolute path, "..", a drive) stops everything
 before anything is written.
 """
@@ -112,7 +115,7 @@ def _same(path, info, z):
         if os.path.getsize(path) != info.file_size:
             return False
         h1 = hashlib.sha256()
-        with open(path, "rb") as f:
+        with _uncached_reader(path) as f:          # (what the card holds, not this computer's copy)
             for b in iter(lambda: f.read(1 << 20), b""):
                 h1.update(b)
         h2 = hashlib.sha256()
@@ -168,8 +171,91 @@ def plan(zip_path, root, demo_games=True):
     return Plan(zip_path, root, items, version, top)
 
 
+def _uncached_reader(path):
+    """The file at path opened for reading what is on the card, not what this computer kept of it:
+    the page cache dropped for it first (Linux), or reads past the cache (macOS). Elsewhere (Windows)
+    the writes were flushed to the card before and the file is read as it is."""
+    f = open(path, "rb")
+    fd = f.fileno()
+    try:
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        elif hasattr(os, "uname") and os.uname().sysname == "Darwin":
+            import fcntl
+            fcntl.fcntl(fd, 48, 1)              # F_NOCACHE
+    except (OSError, AttributeError, ValueError):
+        pass
+    return f
+
+
+def _on_card(path, info):
+    """Does the card hold exactly the package's file here (its size and its CRC-32, as the zip records
+    them)? Read back from the card itself as far as the computer allows."""
+    import zlib
+    try:
+        if os.path.getsize(path) != info.file_size:
+            return False
+        crc = 0
+        with _uncached_reader(path) as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                crc = zlib.crc32(b, crc)
+        return (crc & 0xFFFFFFFF) == info.CRC
+    except OSError:
+        return False
+
+
+def _check_writable(root):
+    """A small file written, flushed, read back and removed: a card locked by its switch, mounted
+    read-only or failing says so here, before any file of the package is touched."""
+    probe = os.path.join(root, ".gammaos-pico-write-check.tmp")
+    data = b"GammaOS Pico write check\n"
+    try:
+        with open(probe, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        with _uncached_reader(probe) as f:
+            back = f.read()
+        os.remove(probe)
+    except OSError as e:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        raise InstallError("The card cannot be written (%s). Check its lock switch, and that it is not "
+                           "mounted read-only." % (e.strerror or e))
+    if back != data:
+        raise InstallError("The card did not keep what was written to it: it may be failing, or a fake "
+                           "card smaller than it says. Try another card.")
+
+
+def _write_one(z, it, progress, state):
+    """One file: written whole to <name>.tmp, flushed to the card, renamed over the old one."""
+    d = os.path.dirname(it.dest)
+    os.makedirs(d, exist_ok=True)
+    tmp = it.dest + ".tmp"
+    with z.open(it.info) as src, open(tmp, "wb") as out:
+        while True:
+            b = src.read(1 << 20)
+            if not b:
+                break
+            out.write(b)
+            state["done"] += len(b)
+            if progress:
+                progress(min(state["done"], state["total"]), state["total"], it.rel)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, it.dest)
+
+
 def apply(p, progress=None, cancel=None):
-    """Carry out a plan. progress(done_bytes, total_bytes, rel). Returns the list of paths written."""
+    """Carry out a plan. progress(done_bytes, total_bytes, rel). Returns the list of paths written.
+
+    Every file written is read back from the card and compared with the package (size and CRC-32);
+    one that does not match is written again, once. At the end every file of the package the card
+    should now hold (new, replaced and unchanged ones) is checked the same way, so a write the card
+    lost or a file changed meanwhile is caught: it is written once more, and if it still does not
+    match the update stops with the files named instead of saying it is done."""
     import shutil
     todo = [i for i in p.items if i.action in (NEW, REPLACE)]
     total = sum(i.size for i in todo)
@@ -180,35 +266,46 @@ def apply(p, progress=None, cancel=None):
     replaced = sum(os.path.getsize(i.dest) for i in todo if i.action == REPLACE and os.path.exists(i.dest))
     if free is not None and total - replaced > free:
         raise InstallError("The card needs %s more free space for this package." % _mb(total - replaced - free))
+    _check_writable(p.root)
     written = []
-    done = 0
+    state = {"done": 0, "total": total}
     z = zipfile.ZipFile(p.zip_path)
     try:
         for it in todo:
             if cancel is not None and cancel.is_set():
                 raise InstallError("Stopped. The files written so far are complete; run it again to finish.")
-            d = os.path.dirname(it.dest)
-            os.makedirs(d, exist_ok=True)
-            tmp = it.dest + ".tmp"
-            with z.open(it.info) as src, open(tmp, "wb") as out:
-                while True:
-                    b = src.read(1 << 20)
-                    if not b:
-                        break
-                    out.write(b)
-                    done += len(b)
-                    if progress:
-                        progress(done, total, it.rel)
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(tmp, it.dest)
+            _write_one(z, it, progress, state)
+            if not _on_card(it.dest, it.info):
+                state["total"] += it.size          # (the second write shows in the bar)
+                _write_one(z, it, progress, state)
             written.append(it.dest)
         make_rom_dirs(p.root)
         _sync_dirs(set(os.path.dirname(w) for w in written) | {p.root})
+        # the whole package, as the card holds it now
+        bad = []
+        for it in p.items:
+            if it.action not in (NEW, REPLACE, SAME):
+                continue
+            if cancel is not None and cancel.is_set():
+                raise InstallError("Stopped. The files written so far are complete; run it again to finish.")
+            if _on_card(it.dest, it.info):
+                continue
+            _write_one(z, it, progress, state)
+            if not _on_card(it.dest, it.info):
+                bad.append(it.rel)
+            elif it.dest not in written:
+                written.append(it.dest)
+        if bad:
+            raise InstallError("%d file%s did not end up on the card as the package has %s: %s%s. The card "
+                               "may be failing or full; check it, then run the update again."
+                               % (len(bad), "" if len(bad) == 1 else "s", "it" if len(bad) == 1 else "them",
+                                  ", ".join(bad[:10]), "..." if len(bad) > 10 else ""))
+        _sync_dirs(set(os.path.dirname(w) for w in written) | {p.root})
     finally:
         z.close()
+    p.verified = sum(1 for i in p.items if i.action in (NEW, REPLACE, SAME))
     if progress:
-        progress(total, total, "")
+        progress(state["total"], state["total"], "")
     return written
 
 

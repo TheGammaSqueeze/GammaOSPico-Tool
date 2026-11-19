@@ -66,6 +66,11 @@ the first time, right-click it and choose **Open**.
   Wi-Fi and Bluetooth firmware (`bios/connsys/`) and HTTPS's trusted roots (`bios/certs/`), are
   brought up to date with it. Each file is written whole (to a temporary file, flushed, then
   renamed), so a card pulled out halfway holds the old file or the new one, never half of one.
+- An update **checks that the card really took it**: the card is tested for writes first (a
+  locked or read-only card is refused before anything is written), every file written is read
+  back from the card and compared with the package, and at the end every file of the package is
+  checked on the card again. A file that does not match is written once more; if it still does not
+  match, the update stops and names it instead of saying it is done.
 - Copies your Game Boy Advance BIOS to `bios/gba_bios.bin` after checking it (16384 bytes, and
   the usual dump's checksum).
 

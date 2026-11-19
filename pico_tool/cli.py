@@ -189,8 +189,9 @@ def _install(a, demo):
     elif not _confirm("Write these files to %s?" % root, a.yes):
         return 1
     else:
-        install.apply(p, progress=lambda d, t, r: _bar(d, t, r))
-        _out("Done.")
+        written = install.apply(p, progress=lambda d, t, r: _bar(d, t, r))
+        _out("Done: %d files written, all %d of the package's files read back from the card and checked."
+             % (len(written), getattr(p, "verified", 0)))
     if a.bios:
         _out("BIOS copied to %s" % install_bios(root, a.bios))
     return 0

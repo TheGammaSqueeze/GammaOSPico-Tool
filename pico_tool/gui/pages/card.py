@@ -488,9 +488,11 @@ class CardPage(Page):
 
         def done(written):
             self._busy(False)
-            self.app.status("The card is ready: %d files written." % len(written))
-            widgets.tell(self.app, "The card is ready", "GammaOS Pico %s is on the card (%d files written). Eject "
-                         "the card safely before taking it out." % (plan.version or "", len(written)))
+            checked = getattr(plan, "verified", 0)
+            self.app.status("The card is ready: %d files written, %d checked on the card." % (len(written), checked))
+            widgets.tell(self.app, "The card is ready", "GammaOS Pico %s is on the card (%d files written, all %d "
+                         "of the package's files read back from the card and checked). Eject the card safely "
+                         "before taking it out." % (plan.version or "", len(written), checked))
             self._after_install()
         self.app.run_bg(work, done, self._failed, name="install")
 
