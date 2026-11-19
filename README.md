@@ -60,8 +60,11 @@ the first time, right-click it and choose **Open**.
   written. Your console is picked on the Card tab or in Settings, and the tool remembers the one
   it last saw on the Console tab. A package you downloaded before works too (offline).
 - An update **never replaces or deletes your files**: settings, `folders.txt`, play time, the
-  recently played list, the archive index, saves, states, games, your BIOS, box art and
-  `boot.cfg` all stay as they are. Each file is written whole (to a temporary file, flushed, then
+  recently played list, the archive index, saves, states, games, your BIOS, box art,
+  `boot.cfg`, your saved Wi-Fi networks and your RetroAchievements account and unlocks
+  (`gammaos/net/`, `gammaos/ra/`) all stay as they are. The release's own files in `bios/`, the
+  Wi-Fi and Bluetooth firmware (`bios/connsys/`) and HTTPS's trusted roots (`bios/certs/`), are
+  brought up to date with it. Each file is written whole (to a temporary file, flushed, then
   renamed), so a card pulled out halfway holds the old file or the new one, never half of one.
 - Copies your Game Boy Advance BIOS to `bios/gba_bios.bin` after checking it (16384 bytes, and
   the usual dump's checksum).

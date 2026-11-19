@@ -18,6 +18,12 @@ from .systems import SYSTEMS
 USER_FILES = ("gammaos/settings.bin", "gammaos/folders.txt", "gammaos/playtime.txt", "gammaos/recent.txt",
               "gammaos/archives.idx", "gammaos/cart_header.bin", "gammaos/blackbox.bin", "gammaos/boot.cfg")
 USER_DIRS = ("saves", "states", "roms", "bios")
+# the console's own data under gammaos/ (1.1): saved Wi-Fi networks, kept box art lookups, the
+# RetroAchievements account, its unlocks kept offline and its caches; never replaced or removed
+USER_PREFIXES = ("gammaos/net/", "gammaos/ra/")
+# inside bios/ but the release's own, replaced by every update: the Wi-Fi and Bluetooth chip's
+# firmware and HTTPS's trusted roots (1.1)
+PACKAGE_PREFIXES = ("bios/connsys/", "bios/certs/")
 
 BIOS_SIZE = 16384
 BIOS_MD5 = "a860e8c0b6d573d191e4ec7db1b1e4f6"
@@ -77,6 +83,10 @@ def is_user_path(rel):
     rel = rel.replace("\\", "/").strip("/")
     low = rel.lower()
     if low in USER_FILES:
+        return True
+    if low.startswith(PACKAGE_PREFIXES):
+        return False
+    if low.startswith(USER_PREFIXES):
         return True
     top = low.split("/", 1)[0]
     if top in USER_DIRS:

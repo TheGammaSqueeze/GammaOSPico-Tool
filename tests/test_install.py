@@ -34,6 +34,38 @@ def test_new_card(tmp_path):
     assert not any(k.endswith(".tmp") for k in t)
 
 
+def test_update_replaces_firmware_and_roots_keeps_network_and_ra_data(tmp_path):
+    """1.1: bios/connsys/ and bios/certs/ are the release's (replaced), gammaos/net/ and gammaos/ra/
+    are the console's own data (kept), although bios/ and gammaos/ otherwise go the other way."""
+    card = tmp_path / "card"
+    old = pkg.make_package(str(tmp_path / "old.zip"), "1.0.2", extra={
+        "bios/connsys/WIFI_RAM_CODE_soc1_0_2a_1.bin": b"FW-OLD", "bios/certs/roots.der": b"ROOTS-OLD"})
+    install.apply(install.plan(old, str(card.mkdir() or card)))
+    mine = {"gammaos/net/wifi.dat": b"saved networks", "gammaos/net/lrdb/1.db": b"lists",
+            "gammaos/ra/account.dat": b"account", "gammaos/ra/queue.dat": b"unlocks"}
+    for rel, data in mine.items():
+        p = card / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    new = pkg.make_package(str(tmp_path / "new.zip"), "1.1.0", extra={
+        "bios/connsys/WIFI_RAM_CODE_soc1_0_2a_1.bin": b"FW-NEW", "bios/certs/roots.der": b"ROOTS-NEW",
+        "gammaos/ra/account.dat": b"never"})
+    p = install.plan(new, str(card))
+    acts = {i.rel: i.action for i in p.items}
+    assert acts["bios/connsys/WIFI_RAM_CODE_soc1_0_2a_1.bin"] == install.REPLACE
+    assert acts["bios/certs/roots.der"] == install.REPLACE
+    assert acts["gammaos/ra/account.dat"] == install.KEEP
+    install.apply(p)
+    t = tree(str(card))
+    assert t["bios/connsys/WIFI_RAM_CODE_soc1_0_2a_1.bin"] == b"FW-NEW" and t["bios/certs/roots.der"] == b"ROOTS-NEW"
+    for rel, data in mine.items():
+        assert t[rel] == data, rel
+    for rel in ("gammaos/net/wifi.dat", "gammaos/ra/queue.dat", "gammaos/ra/b/1.bdg", "bios/gba_bios.bin"):
+        assert layout.is_user_path(rel), rel
+    for rel in ("bios/connsys/x.bin", "BIOS/Certs/roots.der", "gammaos/menu.pack"):
+        assert not layout.is_user_path(rel), rel
+
+
 def test_update_keeps_the_users_files(tmp_path):
     card = tmp_path / "card"
     old = pkg.make_package(str(tmp_path / "old.zip"), "2026.11.01", menu=b"MENU-OLD")
