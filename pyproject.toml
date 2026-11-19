@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gammaos-pico-tool"
-version = "1.0.3"
+version = "1.1.0"
 description = "Set up GammaOS Pico microSD cards, manage their box art, and back up or update the bootloader of the Konkr Pocket Advance and Konkr Pocket Block (window and command line)"
 readme = "README.md"
 requires-python = ">=3.9"
