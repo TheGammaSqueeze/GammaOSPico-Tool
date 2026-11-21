@@ -20,8 +20,9 @@ USER_FILES = ("gammaos/settings.bin", "gammaos/folders.txt", "gammaos/playtime.t
               "gammaos/snescore.cfg")
 USER_DIRS = ("saves", "states", "roms", "bios")
 # the console's own data under gammaos/ (1.1): saved Wi-Fi networks, kept box art lookups, the
-# RetroAchievements account, its unlocks kept offline and its caches; never replaced or removed
-USER_PREFIXES = ("gammaos/net/", "gammaos/ra/", "gammaos/coreopt-")
+# RetroAchievements account, its unlocks kept offline and its caches; each core's options; the
+# player's button maps for each system and game (gammaos/controls/); never replaced or removed
+USER_PREFIXES = ("gammaos/net/", "gammaos/ra/", "gammaos/coreopt-", "gammaos/controls/")
 # the cheats (1.1.1): the release's database is gammaos/cheats/<system>.gcd, replaced by every
 # update; the folder for each system under it holds the user's own .cht files and what the console
 # keeps for each game (the cheats on, the list picked), never replaced or removed

@@ -62,7 +62,8 @@ def test_update_replaces_firmware_and_roots_keeps_network_and_ra_data(tmp_path):
         assert t[rel] == data, rel
     for rel in ("gammaos/net/wifi.dat", "gammaos/ra/queue.dat", "gammaos/ra/b/1.bdg", "bios/gba_bios.bin",
                 "gammaos/cheats/snes/Super Mario World.cht", "gammaos/cheats/gba/Pokemon LeafGreen.on",
-                "gammaos/cheats/gba/Pokemon LeafGreen.use", "gammaos/snescore.cfg", "gammaos/coreopt-armsnes.cfg"):
+                "gammaos/cheats/gba/Pokemon LeafGreen.use", "gammaos/snescore.cfg", "gammaos/coreopt-armsnes.cfg",
+                "gammaos/controls/gba.map", "gammaos/controls/gba/Pokemon LeafGreen.map"):
         assert layout.is_user_path(rel), rel
     for rel in ("bios/connsys/x.bin", "BIOS/Certs/roots.der", "gammaos/menu.pack", "gammaos/cheats/snes.gcd",
                 "cores/armsnes-pico.blob"):
