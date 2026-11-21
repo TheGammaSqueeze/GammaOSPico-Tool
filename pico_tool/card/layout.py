@@ -16,11 +16,16 @@ from .systems import SYSTEMS
 
 # never replaced or removed by an update (kept when they are there, made when they are not)
 USER_FILES = ("gammaos/settings.bin", "gammaos/folders.txt", "gammaos/playtime.txt", "gammaos/recent.txt",
-              "gammaos/archives.idx", "gammaos/cart_header.bin", "gammaos/blackbox.bin", "gammaos/boot.cfg")
+              "gammaos/archives.idx", "gammaos/cart_header.bin", "gammaos/blackbox.bin", "gammaos/boot.cfg",
+              "gammaos/snescore.cfg")
 USER_DIRS = ("saves", "states", "roms", "bios")
 # the console's own data under gammaos/ (1.1): saved Wi-Fi networks, kept box art lookups, the
 # RetroAchievements account, its unlocks kept offline and its caches; never replaced or removed
-USER_PREFIXES = ("gammaos/net/", "gammaos/ra/")
+USER_PREFIXES = ("gammaos/net/", "gammaos/ra/", "gammaos/coreopt-")
+# the cheats (1.1.1): the release's database is gammaos/cheats/<system>.gcd, replaced by every
+# update; the folder for each system under it holds the user's own .cht files and what the console
+# keeps for each game (the cheats on, the list picked), never replaced or removed
+CHEATS_DIR = "gammaos/cheats/"
 # inside bios/ but the release's own, replaced by every update: the Wi-Fi and Bluetooth chip's
 # firmware and HTTPS's trusted roots (1.1)
 PACKAGE_PREFIXES = ("bios/connsys/", "bios/certs/")
@@ -87,6 +92,8 @@ def is_user_path(rel):
     if low.startswith(PACKAGE_PREFIXES):
         return False
     if low.startswith(USER_PREFIXES):
+        return True
+    if low.startswith(CHEATS_DIR) and "/" in low[len(CHEATS_DIR):]:
         return True
     top = low.split("/", 1)[0]
     if top in USER_DIRS:

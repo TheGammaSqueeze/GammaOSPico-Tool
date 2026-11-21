@@ -60,9 +60,12 @@ def test_update_replaces_firmware_and_roots_keeps_network_and_ra_data(tmp_path):
     assert t["bios/connsys/WIFI_RAM_CODE_soc1_0_2a_1.bin"] == b"FW-NEW" and t["bios/certs/roots.der"] == b"ROOTS-NEW"
     for rel, data in mine.items():
         assert t[rel] == data, rel
-    for rel in ("gammaos/net/wifi.dat", "gammaos/ra/queue.dat", "gammaos/ra/b/1.bdg", "bios/gba_bios.bin"):
+    for rel in ("gammaos/net/wifi.dat", "gammaos/ra/queue.dat", "gammaos/ra/b/1.bdg", "bios/gba_bios.bin",
+                "gammaos/cheats/snes/Super Mario World.cht", "gammaos/cheats/gba/Pokemon LeafGreen.on",
+                "gammaos/cheats/gba/Pokemon LeafGreen.use", "gammaos/snescore.cfg", "gammaos/coreopt-armsnes.cfg"):
         assert layout.is_user_path(rel), rel
-    for rel in ("bios/connsys/x.bin", "BIOS/Certs/roots.der", "gammaos/menu.pack"):
+    for rel in ("bios/connsys/x.bin", "BIOS/Certs/roots.der", "gammaos/menu.pack", "gammaos/cheats/snes.gcd",
+                "cores/armsnes-pico.blob"):
         assert not layout.is_user_path(rel), rel
 
 
@@ -275,3 +278,31 @@ def test_a_file_changed_after_the_plan_is_put_right(tmp_path):
     install.apply(p)
     with zipfile.ZipFile(new) as z:
         assert open(victim.dest, "rb").read() == z.read(victim.info)
+
+
+def test_update_to_1_1_1_cheats(tmp_path):
+    """1.1.1 brings the cheat packs and armSNES: the packs are written over, the player's cheat
+    files and what the console keeps for each game stay as they are"""
+    card = tmp_path / "card"
+    old = pkg.make_package(str(tmp_path / "old.zip"), "1.1.0", extra={"gammaos/cheats/gba.gcd": b"OLD-PACK"})
+    install.apply(install.plan(old, str(card.mkdir() or card)))
+    mine = {"gammaos/cheats/gba/My Game.cht": b"cheats = 0", "gammaos/cheats/gba/My Game.on": b"8200",
+            "gammaos/cheats/gba/My Game.use": b"none", "gammaos/snescore.cfg": b"armsnes",
+            "gammaos/coreopt-armsnes.cfg": b"armsnes_mode=Fast"}
+    for rel, data in mine.items():
+        d = card.joinpath(*rel.split("/"))
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_bytes(data)
+    new = pkg.make_package(str(tmp_path / "new.zip"), "1.1.1", extra={
+        "gammaos/cheats/gba.gcd": b"NEW-PACK", "cores/armsnes-pico.blob": b"BLOB",
+        "gammaos/cheats/gba/My Game.on": b"never"})
+    p = install.plan(new, str(card))
+    acts = {i.rel: i.action for i in p.items}
+    assert acts["gammaos/cheats/gba.gcd"] == install.REPLACE
+    assert acts["cores/armsnes-pico.blob"] == install.NEW
+    assert acts["gammaos/cheats/gba/My Game.on"] == install.KEEP
+    install.apply(p)
+    t = tree(str(card))
+    assert t["gammaos/cheats/gba.gcd"] == b"NEW-PACK" and t["cores/armsnes-pico.blob"] == b"BLOB"
+    for rel, data in mine.items():
+        assert t[rel] == data, rel
