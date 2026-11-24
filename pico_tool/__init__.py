@@ -1,6 +1,6 @@
 """GammaOS Pico Tool: set up the microSD card, manage box art and the console's bootloader."""
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 APP_NAME = "GammaOS Pico Tool"
 REPO = "TheGammaSqueeze/GammaOSPico"
