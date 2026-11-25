@@ -104,6 +104,110 @@ def test_console_flash_backs_up_first(tmp_path, capsys, console):
     assert "KPA0001" in out
 
 
+def _flash_120(tmp_path, console, model_key="kpa", **kw):
+    from pico_tool.console import models
+    model = models.by_key(model_key)
+    kw.setdefault("tee_gammaos", console.tee_image("gammaos"))
+    kw.setdefault("tee_stock", console.tee_image("stock"))
+    return pkg.make_flash_package(str(tmp_path / ("gammaos-pico-%s-1.2.0-flash.zip" % model_key)), "1.2.0",
+                                  gammaos=console.make_image("gammaos-pico", "1.2.0", model),
+                                  stock=console.stock_image(model), console=model_key, **kw)
+
+
+@pytest.mark.parametrize("model_key", ["kpa", "block"])
+def test_console_flash_1_2_0_writes_the_secure_firmware_too(tmp_path, capsys, console, monkeypatch, model_key):
+    from pico_tool.console import models
+    model = models.by_key(model_key)
+    console.state.model = model
+    console.state.lk = {"lk_a": console.stock_image(model), "lk_b": console.stock_image(model)}
+    fz = _flash_120(tmp_path, console, model_key)
+    # the question says the secure firmware is written too
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz)
+    assert rc == 1 and not console.state.writes
+    assert ("Write GammaOS Pico 1.2.0 to lk_a and lk_b of this %s, and its secure firmware to tee_a and tee_b?"
+            % model.name) in err
+    # this console's bootloader is older than 1.2.0: the backup made before the question has no tee
+    assert "The secure firmware was not backed up" in out
+    # and the tee is not read back
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
+    assert rc == 0, err
+    assert [p for p, _h in console.state.writes] == ["tee_a", "tee_b", "lk_a", "lk_b"]
+    assert console.state.tee["tee_a"] == console.state.tee["tee_b"] == console.tee_image("gammaos")
+    assert "tee_a: written, not checked (the console's bootloader cannot read it back)" in out
+    assert "lk_b: written and checked" in out
+    assert "Done: GammaOS Pico 1.2.0 and its secure firmware are on the console." in out
+    # now it runs 1.2.0: everything is read back
+    console.state.tee_read = True
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
+    assert rc == 0 and "tee_a: written and checked" in out and "not checked" not in out
+    # back to stock: the stock secure firmware with the stock bootloader
+    del console.state.writes[:]
+    rc, out, err = run(capsys, "console", "stock", "--zip", fz)
+    assert rc == 1 and not console.state.writes
+    assert ("Write the stock bootloader to lk_a and lk_b of this %s, and the stock secure firmware to tee_a and "
+            "tee_b?" % model.name) in err
+    rc, out, err = run(capsys, "console", "stock", "--zip", fz, "--yes")
+    assert rc == 0, err
+    assert [p for p, _h in console.state.writes] == ["tee_a", "tee_b", "lk_a", "lk_b"]
+    assert console.state.tee["tee_a"] == console.state.tee["tee_b"] == console.tee_image("stock")
+    assert console.state.lk["lk_a"] == console.state.lk["lk_b"] == console.stock_image(model)
+    assert "Done: the stock bootloader and the stock secure firmware are on the console." in out
+
+
+def test_console_old_package_says_nothing_about_the_secure_firmware(tmp_path, capsys, console, monkeypatch):
+    fz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.1.2-flash.zip"), "1.1.2")
+    console.state.tee_read = True
+    console.backup_lk(console.find_consoles()[0], console.state.backup_root, __import__("threading").Event(),
+                      lambda f, m: None)
+    tee_before = dict(console.state.tee)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz)
+    assert rc == 1 and "Write GammaOS Pico 1.0.0 to lk_a and lk_b of this Konkr Pocket Advance?" in err
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
+    assert rc == 0, err
+    assert [p for p, _h in console.state.writes] == ["lk_a", "lk_b"] and console.state.tee == tee_before
+    assert "tee" not in out and "secure firmware" not in out and "tee" not in err
+    assert "Done: GammaOS Pico 1.0.0 is on the console." in out
+    rc, out, err = run(capsys, "console", "stock", "--zip", fz, "--yes")
+    assert rc == 0 and "secure firmware" not in out and console.state.tee == tee_before
+
+
+def test_console_backup_before_a_write_gets_the_packages_images(tmp_path, capsys, console):
+    """On a console that cannot send its data in one piece, these save reading what is in hand."""
+    fz = _flash_120(tmp_path, console)
+    assert run(capsys, "console", "flash", "--zip", fz, "--yes")[0] == 0
+    cands = console.state.backup_candidates
+    assert set(cands) == {"lk_a", "lk_b", "tee_a", "tee_b"}
+    assert cands["lk_a"] == [console.make_image("gammaos-pico", "1.2.0"), console.stock_image()]
+    assert cands["tee_b"] == [console.tee_image("gammaos"), console.tee_image("stock")]
+
+
+def test_console_refuses_a_package_whose_tee_is_not_one(tmp_path, capsys, console):
+    """An LK image where the secure firmware should be: refused before anything is written."""
+    fz = _flash_120(tmp_path, console, tee_gammaos=console.make_image("gammaos-pico", "1.2.0"))
+    rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
+    assert rc == 1 and not console.state.writes
+    assert "secure firmware is refused, so nothing was written" in err
+
+
+def test_console_backup_and_restore_with_the_secure_firmware(tmp_path, capsys, console):
+    console.state.tee_read = True
+    rc, out, err = run(capsys, "console", "backup")
+    assert rc == 0 and "secure firmware" in out and "not backed up" not in out
+    (b,) = console.list_backups(console.state.backup_root)
+    rc, out, err = run(capsys, "console", "backups")
+    assert "secure firmware (tee_a and tee_b)" in out
+    fz = _flash_120(tmp_path, console)
+    assert run(capsys, "console", "flash", "--zip", fz, "--yes")[0] == 0
+    del console.state.writes[:]
+    rc, out, err = run(capsys, "console", "restore", b["path"], "--yes")
+    assert rc == 0, err
+    assert [p for p, _h in console.state.writes] == ["tee_a", "tee_b", "lk_a", "lk_b"]
+    assert console.state.tee["tee_a"] == console.tee_image("stock")
+    assert "and its secure firmware are on the console" in out
+
+
 def test_console_refuses_bad_images(tmp_path, capsys, console):
     img = tmp_path / "x.img"
     img.write_bytes(b"garbage")
@@ -124,7 +228,7 @@ def test_console_without_yes_is_refused(tmp_path, capsys, console, monkeypatch):
     assert rc == 1 and not console.state.writes
 
 
-def test_console_block_writes_lk_a_only(tmp_path, capsys, console):
+def test_console_block_writes_both_lk_copies(tmp_path, capsys, console):
     from pico_tool import config
     from pico_tool.console.models import BLOCK
     console.state.model = BLOCK
@@ -135,16 +239,20 @@ def test_console_block_writes_lk_a_only(tmp_path, capsys, console):
     assert config.Settings().get("console_model") == "block"          # remembered for the card's package
     rc, out, err = run(capsys, "console", "flash", "--zip", fz, "--yes")
     assert rc == 0, err
-    assert [p for p, _h in console.state.writes] == ["lk_a"]
-    assert console.state.lk["lk_b"] == b"never written by the factory"
+    assert [p for p, _h in console.state.writes] == ["lk_a", "lk_b"]
+    assert console.state.lk["lk_b"].startswith(b"LKIMG:gammaos-pico")
+    assert "lk_a: written and checked" in out and "lk_b: written and checked" in out
     (b,) = console.list_backups(console.state.backup_root)
-    assert b["model"] == "block" and "lk_b" not in b
+    assert b["model"] == "block" and b["lk_b"]["kind"] == "unknown"       # backed up as the factory left it
     rc, out, err = run(capsys, "console", "backups")
-    assert "Konkr Pocket Block" in out and "lk_b" not in out
+    assert "Konkr Pocket Block" in out and "lk_b" in out
+    # the backup's lk_b holds no bootloader, so only lk_a is put back
     rc, out, err = run(capsys, "console", "restore", b["path"], "--yes")
     assert rc == 0 and console.state.lk["lk_a"].startswith(b"STOCKBLK")
+    assert [p for p, _h in console.state.writes] == ["lk_a", "lk_b", "lk_a"]
     rc, out, err = run(capsys, "console", "stock", "--zip", fz, "--yes")
-    assert rc == 0 and [p for p, _h in console.state.writes] == ["lk_a", "lk_a", "lk_a"]
+    assert rc == 0 and [p for p, _h in console.state.writes] == ["lk_a", "lk_b", "lk_a", "lk_a", "lk_b"]
+    assert console.state.lk["lk_b"].startswith(b"STOCKBLK")
 
 
 def test_console_refuses_the_other_consoles_package_and_backup(tmp_path, capsys, console):

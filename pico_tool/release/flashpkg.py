@@ -3,7 +3,9 @@ Pocket Advance, gammaos-pico-block-<version>-flash.zip for the Konkr Pocket Bloc
 
 The package's fastboot/ folder holds lk_<console>_gammaos.img (GammaOS Pico's LK) and
 lk_<console>_stock.img (the console's stock LK), listed with their sha256 in the package's own
-SHA256SUMS. Which console a package is for comes from its top folder's name, or from the image
+SHA256SUMS. From GammaOS Pico 1.2.0 it also holds tee_<console>_gammaos.img and
+tee_<console>_stock.img, the console's secure firmware with and without GammaOS Pico's change; older
+packages have neither, and only the LK is written from those. Which console a package is for comes from its top folder's name, or from the image
 names in it when the folder was renamed.
 """
 
@@ -26,8 +28,9 @@ def _expected_names():
 
 
 def read_images(zip_path, model=None):
-    """{"gammaos": bytes, "stock": bytes (when present), "version": str or None, "model":
-    ConsoleModel}, each image checked against the package's SHA256SUMS when it lists it. With
+    """{"gammaos": bytes, "stock": bytes (when present), "tee_gammaos": bytes and "tee_stock":
+    bytes (when present: packages from 1.2.0 on), "version": str or None, "model": ConsoleModel},
+    each image checked against the package's SHA256SUMS when it lists it. With
     `model` (the console it is meant for), a package for the other console is refused."""
     try:
         z = zipfile.ZipFile(zip_path)
@@ -59,7 +62,8 @@ def read_images(zip_path, model=None):
             raise FlashPackageError("This is the %s's flash package, and this console is a %s: use %s."
                                     % (found.name, model.name, model.flash_package))
         out = {"version": version, "model": found}
-        for key, rel in (("gammaos", found.flash_gammaos), ("stock", found.flash_stock)):
+        for key, rel in (("gammaos", found.flash_gammaos), ("stock", found.flash_stock),
+                         ("tee_gammaos", found.flash_tee_gammaos), ("tee_stock", found.flash_tee_stock)):
             if top + rel not in names:
                 continue
             data = z.read(top + rel)

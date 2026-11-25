@@ -137,6 +137,56 @@ def test_install_backs_up_a_console_with_none(app, tmp_path):
     assert len(b) == 1 and b[0]["lk_a"]["kind"] == "stock"
 
 
+def test_install_1_2_0_writes_the_secure_firmware_and_says_so(app, tmp_path, monkeypatch):
+    from pico_tool.gui import widgets
+    asked = []
+    monkeypatch.setattr(widgets, "ask", lambda app_, title, text, *a, **k: asked.append((title, text)) or True)
+    app.show_name("Console")
+    cp = app.pages[2]
+    assert pump(app, lambda: cp.link is not None)
+    fz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.2.0-flash.zip"), "1.2.0",
+                                gammaos=fake.make_image("gammaos-pico", "1.2.0"),
+                                tee_gammaos=fake.tee_image("gammaos"), tee_stock=fake.tee_image("stock"))
+    cp._flash_source = lambda which: ("file", fz)
+    cp.do_install()
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 4)
+    assert [p for p, _h in fake.state.writes] == ["tee_a", "tee_b", "lk_a", "lk_b"]
+    assert "The secure firmware is written too: its secure firmware to tee_a and tee_b." in asked[-1][1]
+    title, text = app.answers["told"][-1]
+    assert title == "Done" and "GammaOS Pico 1.2.0 and its secure firmware are on the console." in text
+    assert "tee_a: written, not checked (the console's bootloader cannot read it back)" in text
+    assert "lk_a: written and checked" in text
+    assert "The secure firmware was not backed up" in text        # the backup made before the first write
+    # back to stock, on a console that now reads its secure firmware back
+    fake.state.tee_read = True
+    cp.do_stock()
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 8)
+    assert fake.state.tee["tee_b"] == fake.tee_image("stock") and fake.state.lk["lk_b"].startswith(b"STOCK")
+    assert "The secure firmware is written too: the stock secure firmware to tee_a and tee_b." in asked[-1][1]
+    text = app.answers["told"][-1][1]
+    assert "The stock bootloader and the stock secure firmware are on the console." in text
+    assert "tee_b: written and checked" in text and "not checked" not in text
+
+
+def test_install_from_an_older_package_says_nothing_about_the_secure_firmware(app, tmp_path, monkeypatch):
+    from pico_tool.gui import widgets
+    asked = []
+    monkeypatch.setattr(widgets, "ask", lambda app_, title, text, *a, **k: asked.append((title, text)) or True)
+    app.show_name("Console")
+    cp = app.pages[2]
+    assert pump(app, lambda: cp.link is not None)
+    cp.do_backup()
+    assert pump(app, lambda: not cp.busy and fake.list_backups(fake.state.backup_root))
+    fz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.1.2-flash.zip"), "1.1.2")
+    cp._flash_source = lambda which: ("file", fz)
+    cp.do_install()
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 2)
+    assert [p for p, _h in fake.state.writes] == ["lk_a", "lk_b"]
+    text = asked[-1][1] + app.answers["told"][-1][1]
+    assert "secure firmware" not in text and "tee" not in text
+    assert "lk_a: written and checked" in text
+
+
 def test_accent_change_rebuilds(app):
     app.set_accent("Crimson")
     assert app.pal.name == "Crimson"
@@ -163,19 +213,22 @@ def test_block_console_install_and_restore(app, tmp_path):
     assert pump(app, lambda: not cp.busy and len(app.answers["told"]) > told)
     assert "gammaos-pico-block-<version>-flash.zip" in app.answers["told"][-1][1]
     assert fake.state.writes == []
-    # its own package: backed up first, then lk_a only
+    # its own package: backed up first, then both LK copies
     bz = pkg.make_flash_package(str(tmp_path / "gammaos-pico-block-1.0.2-flash.zip"), "1.0.2", console="block")
     cp._flash_source = lambda which: ("file", bz)
     cp.do_install()
-    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 1)
-    assert [p for p, _h in fake.state.writes] == ["lk_a"] and fake.state.lk["lk_b"] == b"left alone"
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 2)
+    assert [p for p, _h in fake.state.writes] == ["lk_a", "lk_b"]
+    assert fake.state.lk["lk_b"].startswith(b"LKIMG:gammaos-pico")
     (b,) = fake.list_backups(fake.state.backup_root)
     assert b["model"] == "block"
     assert pump(app, lambda: cp.backups)
     app.answers["dialog"] = 0                                        # the restore dialog picks the first backup
     cp.do_restore()
-    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 2)
+    # the backup's lk_b is what the factory left there, not a bootloader: only lk_a is put back
+    assert pump(app, lambda: not cp.busy and len(fake.state.writes) == 3)
     assert fake.state.lk["lk_a"].startswith(b"STOCKBLK")
+    assert [p for p, _h in fake.state.writes] == ["lk_a", "lk_b", "lk_a"]
 
 
 def test_console_model_choice_is_shared(app):
@@ -192,7 +245,7 @@ def test_console_model_choice_is_shared(app):
     assert sp.model.get() == "block" and cp.first_model.get() == "block"
     text = "".join(_texts(cp.first_box))
     assert "gammaos-pico-block-windows-tools.zip" in text and "MT6768_Android_scatter.txt" in text
-    assert "only lk_a ticked" in text
+    assert "only lk_a, lk_b, tee_a and tee_b ticked" in text
     assert app.settings.get("console_model") == "block"
 
 

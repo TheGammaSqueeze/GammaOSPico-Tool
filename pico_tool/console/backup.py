@@ -1,15 +1,20 @@
-"""Backups of the console's LK copies: lk_a and lk_b on the Konkr Pocket Advance, lk_a on the Konkr
-Pocket Block (the only copy that is ever written there; see models.py).
+"""Backups of the console's LK copies (lk_a and lk_b) and, when the console's LK can read them
+(GammaOS Pico 1.2.0 and later), of its secure firmware copies (tee_a and tee_b). See models.py.
 
-Layout: <dest_root>/<ident>/<UTC yyyy-mm-dd_HHMMSS>/{lk_a.img, lk_b.img (Pocket Advance), backup.json}
+Layout: <dest_root>/<ident>/<UTC yyyy-mm-dd_HHMMSS>/{lk_a.img, lk_b.img, tee_a.img, tee_b.img,
+backup.json}
 
 backup.json:
     {"ident": "<serialno>", "date": "<UTC ISO 8601>", "model": "kpa" | "block",
      "lk_a": {"sha256": "...", "size": n, "kind": "...", "version": "..." or null},
-     "lk_b": {...} (Pocket Advance only), "tool": "<tool version>"}
+     "lk_b": {...},
+     "tee_a": {"sha256": "...", "size": n, "kind": "secure-firmware" | "unknown"}, "tee_b": {...},
+     "tool": "<tool version>"}
 
-Backups made before the tool knew more than one console have no "model": they are Pocket Advance
-backups.
+Older backups hold less and still load and restore: those made before the tool knew more than one
+console have no "model" (they are Pocket Advance backups), a Pocket Block backup made before 1.2.0
+holds lk_a only, and no backup made before 1.2.0, or from a console whose LK cannot read the secure
+firmware, has the tee entries. A partition without an entry is simply not part of that backup.
 
 A backup is written into "<stamp>.partial" and renamed when complete, so a half written one never
 shows up in the list.
@@ -24,17 +29,21 @@ import os
 import re
 import sys
 import threading
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
-from .device import (ConsoleLink, link_error_text, open_console, partition_size, protocol_error_text,
-                     read_partition)
+from .device import (SLOW_READ_LIMIT, ConsoleLink, link_error_text, open_console, partition_crcs,
+                     partition_size, protocol_error_text, read_partition, supports_tee_read)
 from .errors import ConsoleCancelled, ConsoleError, ConsoleTooOld
 from .fastboot import FastbootFail, LinkError, ProtocolError
-from .lkimage import check_lk_image
-from .models import KPA, ConsoleModel, by_key
+from .lkimage import check_lk_image, check_tee_image
+from .models import KPA, ConsoleModel, by_key, names_text
 
 Progress = Callable[[Optional[float], str], None]
 
+TEE_KIND = "secure-firmware"
+TEE_NOT_BACKED_UP = ("The secure firmware was not backed up: this console's bootloader is older than GammaOS "
+                     "Pico 1.2.0 and cannot read it over USB. The stock secure firmware is in every flash "
+                     "package from 1.2.0 on.")
 BACKUP_JSON = "backup.json"
 BACKUP_FOLDER_NAME = "GammaOS Pico Backups"
 _STAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}(_\d+)?")
@@ -136,28 +145,48 @@ def backup_model(record) -> ConsoleModel:
     return by_key(key, KPA) if key else KPA
 
 
-def _read_both(link: ConsoleLink, cancel, progress: Optional[Progress]) -> Dict[str, bytes]:
-    """Read the console's LK copies twice each and keep them only when both reads agree."""
+def _read_both(link: ConsoleLink, cancel, progress: Optional[Progress],
+               candidates: Optional[Dict[str, Sequence[bytes]]] = None) -> Dict[str, bytes]:
+    """Read the console's LK copies, and its secure firmware copies when its LK can read them,
+    twice each, and keep them only when both reads agree.
+
+    A console without `upload` (device.py) has its partitions built from checksums: the second read
+    is then a second asking of every checksum, which must equal the first. `candidates`
+    ({partition: images it may hold}, from the flash package in hand) saves fetching bytes the tool
+    already has; without them everything that is not blank comes the slow way."""
     images: Dict[str, bytes] = {}
-    names = link.model.partitions
+    names = list(link.model.partitions)
     passes = len(names) * 2
     step = [0]
+    info: dict = {}
 
     def report(done: int, total: int) -> None:
         if progress and total:
             frac = (step[0] + done / total) / passes * 0.9
             name = names[step[0] // 2]
             word = "Reading" if step[0] % 2 == 0 else "Checking"
-            progress(frac, "%s %s (%d of %d KB)." % (word, name, done // 1024, total // 1024))
+            text = "%s %s (%d of %d KB)." % (word, name, done // 1024, total // 1024)
+            slow = info.get("slow_total", 0)
+            if slow and step[0] % 2 == 0:
+                text += " " + slow_read_text(slow)
+            progress(frac, text)
 
     with open_console(link) as session:
+        if supports_tee_read(session):
+            names += link.model.tee_partitions
+            passes = len(names) * 2
         for name in names:
             expected = partition_size(session, name)
-            first = read_partition(session, name, cancel=cancel, on_bytes=report)
+            info.clear()
+            first = read_partition(session, name, cancel=cancel, on_bytes=report,
+                                   candidates=(candidates or {}).get(name, ()), info=info)
             step[0] += 1
-            second = read_partition(session, name, cancel=cancel, on_bytes=report)
+            if "crcs" in info:
+                same = partition_crcs(session, name, cancel=cancel, on_bytes=report) == info["crcs"]
+            else:
+                same = read_partition(session, name, cancel=cancel, on_bytes=report) == first
             step[0] += 1
-            if first != second:
+            if not same:
                 raise ConsoleError("Two reads of %s gave different data; try another cable or USB port and back "
                                    "up again." % name)
             if expected is not None and len(first) != expected:
@@ -165,6 +194,15 @@ def _read_both(link: ConsoleLink, cancel, progress: Optional[Progress]) -> Dict[
                                    "into its bootloader and back up again." % (len(first), name, expected))
             images[name] = first
     return images
+
+
+def slow_read_text(slow_bytes: int) -> str:
+    """The note in a backup's progress line on a console that cannot send its data in one piece."""
+    if slow_bytes > SLOW_READ_LIMIT:
+        return ("This console sends %d MB of it a few bytes at a time (more than 4 MB): this takes a long time."
+                % (slow_bytes >> 20))
+    return ("This console sends %d KB of it a few bytes at a time: this takes a few minutes."
+            % max(1, slow_bytes >> 10))
 
 
 def operation_error(exc: BaseException, during: str) -> ConsoleError:
@@ -186,13 +224,20 @@ def operation_error(exc: BaseException, during: str) -> ConsoleError:
 
 
 def backup_lk(link: ConsoleLink, dest_root: str, cancel: Optional[threading.Event],
-              progress: Optional[Progress]) -> str:
-    """Read the console's LK copies (lk_a and lk_b, or lk_a alone on the Pocket Block) and save them
-    with their checksums. Returns the backup folder."""
+              progress: Optional[Progress],
+              candidates: Optional[Dict[str, Sequence[bytes]]] = None) -> str:
+    """Read the console's LK copies (lk_a and lk_b) and save them with their checksums, together
+    with its secure firmware copies (tee_a and tee_b) when its LK can read them. When it cannot (an
+    LK older than 1.2.0) the backup holds the LK alone, and backup_text() and the last progress
+    line say so. Returns the backup folder.
+
+    `candidates` ({partition: [images it may hold]}: the flash package's GammaOS Pico and stock
+    images when a backup is made before a write) only matters on a console without `upload`, where
+    it saves fetching those bytes a few at a time; see _read_both."""
     if progress:
         progress(0.0, "Opening the console.")
     try:
-        images = _read_both(link, cancel, progress)
+        images = _read_both(link, cancel, progress, candidates)
     except (ConsoleCancelled, ConsoleTooOld):
         raise
     except Exception as exc:
@@ -212,16 +257,20 @@ def backup_lk(link: ConsoleLink, dest_root: str, cancel: Optional[threading.Even
     record = {"ident": link.ident, "date": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "model": link.model.key}
     try:
         os.makedirs(partial)
-        for name in link.model.partitions:
+        for name in images:
             data = images[name]
-            info = check_lk_image(data, link.model)
             path = os.path.join(partial, name + ".img")
             _write_file(path, data)
             digest = _sha(data)
             if _file_sha(path) != digest or os.path.getsize(path) != len(data):
                 raise ConsoleError("The backup file %s did not read back correctly; choose another folder and "
                                    "back up again." % path)
-            record[name] = {"sha256": digest, "size": len(data), "kind": info.kind, "version": info.version}
+            if name in link.model.tee_partitions:
+                kind = "unknown" if check_tee_image(data).problems else TEE_KIND
+                record[name] = {"sha256": digest, "size": len(data), "kind": kind}
+            else:
+                info = check_lk_image(data, link.model)
+                record[name] = {"sha256": digest, "size": len(data), "kind": info.kind, "version": info.version}
         record["tool"] = _tool_version()
         tmp_json = os.path.join(partial, BACKUP_JSON + ".tmp")
         with open(tmp_json, "w", encoding="utf-8") as f:
@@ -239,8 +288,28 @@ def backup_lk(link: ConsoleLink, dest_root: str, cancel: Optional[threading.Even
         raise ConsoleError("The backup could not be saved in %s (%s); choose another folder or free some space."
                            % (dest_root, exc.strerror or exc)) from exc
     if progress:
-        progress(1.0, "Backup saved in %s." % final)
+        note = "" if any(n in images for n in link.model.tee_partitions) else " " + TEE_NOT_BACKED_UP
+        progress(1.0, "Backup saved in %s.%s" % (final, note))
     return final
+
+
+def backup_text(path: str) -> str:
+    """What the backup in `path` holds, in a sentence or two for the person: which copies were
+    saved, and that the secure firmware was not when the console's LK could not read it."""
+    try:
+        with open(os.path.join(path, BACKUP_JSON), encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    if not isinstance(record, dict):
+        record = {}
+    model = backup_model(record)
+    lk = [p for p in model.partitions if isinstance(record.get(p), dict)]
+    tee = [p for p in model.tee_partitions if isinstance(record.get(p), dict)]
+    text = "The console's bootloader (%s)" % names_text(lk) if lk else "The console's bootloader"
+    if tee:
+        return "%s and secure firmware (%s) are saved in %s" % (text, names_text(tee), path)
+    return "%s is saved in %s\n%s" % (text, path, TEE_NOT_BACKED_UP)
 
 
 def _remove_tree(path: str) -> None:
@@ -262,8 +331,11 @@ def _check_backup(folder: str, record: dict) -> List[str]:
     key = record.get("model")
     if key is not None and by_key(key, None) is None:
         return ["The backup is of a console this version of the tool does not know (%s)." % key]
-    for name in backup_model(record).partitions:
+    made_from = backup_model(record)
+    for name in made_from.all_partitions:
         entry = record.get(name)
+        if entry is None and name not in made_from.backup_always:
+            continue      # not part of this backup (an older one, or the tee could not be read)
         if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
             problems.append("The backup has no record of %s." % name)
             continue
@@ -325,9 +397,12 @@ def has_backup(dest_root: str, ident: str) -> bool:
 
 
 def read_backup(path: str, model: Optional[ConsoleModel] = None) -> Dict[str, bytes]:
-    """Load a backup folder's LK copies (those of the console it was made from), checked against the
-    recorded sha256, for write_lk. With `model` (the console it would be written to), a backup of
-    the other console is refused."""
+    """Load what a backup folder holds ({partition: image}: the LK copies and, when it has them, the
+    secure firmware copies), checked against the recorded sha256, for write_lk. With `model` (the
+    console it would be written to), a backup of the other console is refused.
+
+    An LK copy that not every backup holds (the Pocket Block's lk_b, which its factory leaves empty)
+    is left out when what was saved from it is not a bootloader: there is nothing to put back."""
     try:
         with open(os.path.join(path, BACKUP_JSON), encoding="utf-8") as f:
             record = json.load(f)
@@ -344,8 +419,10 @@ def read_backup(path: str, model: Optional[ConsoleModel] = None) -> Dict[str, by
         raise ConsoleError("The backup in %s was made from a %s, not this %s; choose a backup of this console."
                            % (path, made_from.name, model.name))
     images: Dict[str, bytes] = {}
-    for name in made_from.partitions:
+    for name in made_from.all_partitions:
         entry = record.get(name)
+        if entry is None and name not in made_from.backup_always:
+            continue
         if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
             raise ConsoleError("The backup in %s has no record of %s; choose another backup." % (path, name))
         try:
@@ -357,5 +434,8 @@ def read_backup(path: str, model: Optional[ConsoleModel] = None) -> Dict[str, by
         if _sha(data) != entry["sha256"].lower() or len(data) != entry.get("size"):
             raise ConsoleError("The backup's %s.img does not match its checksum, so it was not used; choose "
                                "another backup." % name)
+        if (name in made_from.partitions and name not in made_from.backup_always
+                and check_lk_image(data, made_from).problems):
+            continue
         images[name] = data
     return images

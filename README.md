@@ -2,7 +2,8 @@
 
 The all-in-one desktop tool for **GammaOS Pico** on the **Konkr Pocket Advance** and the **Konkr
 Pocket Block**, for Windows, macOS and Linux. It sets up and updates the microSD card, lists your games exactly the way the console
-does and puts box art on the card, and backs up, updates and restores the console's bootloader.
+does and puts box art on the card, and backs up, updates and restores the console's bootloader
+(and, from GammaOS Pico 1.2.0, the console's secure firmware that goes with it).
 
 ![The Games tab](docs/screenshots/games.png)
 
@@ -10,9 +11,9 @@ does and puts box art on the card, and backs up, updates and restores the consol
 
 > [!CAUTION]
 > **GammaOS Pico is a custom bootloader, and this tool can write it. Both are experimental software,
-> provided as they are, with no warranty of any kind.** Writing a bootloader (`lk_a` and `lk_b` on
-> the Pocket Advance, `lk_a` on the Pocket Block) can leave a console that does not start, and you
-> do it entirely at your own risk. Nobody involved is responsible for a bricked or damaged console,
+> provided as they are, with no warranty of any kind.** Writing a bootloader (`lk_a` and `lk_b`) and,
+> from GammaOS Pico 1.2.0, the secure firmware (`tee_a` and `tee_b`) can leave a console that does
+> not start, and you do it entirely at your own risk. Nobody involved is responsible for a bricked or damaged console,
 > lost data, or anything else that comes from using them. The tool backs the console's bootloader up before its first write, but **nothing is
 > guaranteed**.
 
@@ -104,15 +105,38 @@ the first time, right-click it and choose **Open**.
 Over GammaOS Pico's own bootloader (hold **SELECT + START + R** while turning the console on, then
 connect USB), the tool finds out which console it is and:
 
-- **backs up** its bootloader to this computer: `lk_a` and `lk_b` on the Pocket Advance, `lk_a`
-  on the Pocket Block (automatically before the first write to a console it has no backup of),
+- **backs up** its bootloader to this computer: `lk_a` and `lk_b` (automatically before the first
+  write to a console it has no backup of), and its secure firmware (`tee_a` and `tee_b`) when the
+  console runs GammaOS Pico 1.2.0 or later, which can read it over USB,
 - **installs or updates** GammaOS Pico's bootloader from the latest release or a flash package or
   image you pick,
 - **restores a backup**, or **puts the stock bootloader back**.
 
-Every write asks first, is checked against the image and read back afterwards. On the Pocket Block
-only `lk_a` is ever written (its `_b` copies are never used). A bootloader, flash package or backup
-made for one console is refused on the other.
+From GammaOS Pico 1.2.0 a release also has the console's secure firmware (the "tee"), with a small
+change that lets the bootloader use the console's other CPU cores. The flash package carries it, and
+the tool writes it with the bootloader, on both consoles:
+
+| | Written |
+|---|---|
+| Flash package 1.2.0 or later | `tee_a` and `tee_b` first, then `lk_a` and `lk_b` |
+| Flash package older than 1.2.0, or a single LK image | `lk_a` and `lk_b` |
+| Back to stock | the stock bootloader, and the stock secure firmware when the package has it |
+
+Every write asks first (the question says when the secure firmware is written too), is checked
+against the image and read back afterwards, and the result lists each partition that was written
+and whether it was read back. A console still running a bootloader older than 1.2.0 cannot read its
+secure firmware back: those copies are listed as written, not checked. A bootloader, flash package
+or backup made for one console is refused on the other, and a secure firmware image is never written
+to the bootloader's partitions or the other way round.
+
+Since GammaOS Pico 1.1.0 the Pocket Block cannot send its data to the computer in one piece over
+USB. The tool works with checksums there instead: a write is checked by the checksums of what was
+written, and a backup takes from the flash package in hand whatever the checksums show the console
+already holds, and fetches the rest a few bytes at a time. A backup made with no package (the
+**Back up** action) takes a few minutes on that console.
+
+Up to 1.1.x the tool wrote `lk_a` alone on the Pocket Block; backups made then hold `lk_a` only and
+still restore.
 
 > [!NOTE]
 > The **first** install on a console with its stock bootloader is done with SP Flash Tool v5 and
@@ -125,7 +149,8 @@ made for one console is refused on the other.
 > | SP Flash Tool and MediaTek's USB driver | `gammaos-pico-kpa-windows-tools.zip` | `gammaos-pico-block-windows-tools.zip` |
 > | Flash package | `gammaos-pico-kpa-<version>-flash.zip` | `gammaos-pico-block-<version>-flash.zip` |
 > | Scatter file (in `spflash/gammaos/`) | `MT6785_Android_scatter.txt` | `MT6768_Android_scatter.txt` |
-> | Download Only, ticked | `lk_a` and `lk_b` | `lk_a` only |
+> | Download Only, ticked (1.2.0 and later) | `lk_a`, `lk_b`, `tee_a` and `tee_b` | `lk_a`, `lk_b`, `tee_a` and `tee_b` |
+> | Download Only, ticked (before 1.2.0) | `lk_a` and `lk_b` | `lk_a` only |
 >
 > The Console tab explains it and can save the flash package for you; from then on, the tool
 > takes over.
@@ -150,11 +175,11 @@ gammaos-pico-tool scrape /media/me/GAMMAOS --system gba  # find the missing cove
 gammaos-pico-tool art set /media/me/GAMMAOS "Collie Defense" cover.png
 gammaos-pico-tool art rm /media/me/GAMMAOS "Collie Defense"
 gammaos-pico-tool console detect                         # which console, and its bootloader
-gammaos-pico-tool console backup
+gammaos-pico-tool console backup                         # lk_a and lk_b (and tee_a and tee_b from 1.2.0)
 gammaos-pico-tool console flash --zip gammaos-pico-kpa-2026.12.01-flash.zip
 gammaos-pico-tool console flash --zip gammaos-pico-block-2026.12.01-flash.zip
 gammaos-pico-tool console restore "~/Documents/GammaOS Pico Backups/<console>/<date>"
-gammaos-pico-tool console stock
+gammaos-pico-tool console stock                          # the stock bootloader and secure firmware
 gammaos-pico-tool check-network                          # can GitHub and ScreenScraper be reached securely
 ```
 

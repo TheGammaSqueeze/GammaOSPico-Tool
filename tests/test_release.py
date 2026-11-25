@@ -119,6 +119,23 @@ def test_flash_package(tmp_path):
         flashpkg.read_images(pkg.make_package(str(tmp_path / "card.zip")))
 
 
+def test_flash_package_with_the_secure_firmware(tmp_path):
+    """From 1.2.0: tee_<console>_gammaos.img and tee_<console>_stock.img next to the LK images."""
+    for console, model in (("kpa", KPA), ("block", BLOCK)):
+        p = pkg.make_flash_package(str(tmp_path / ("gammaos-pico-%s-1.2.0-flash.zip" % console)), "1.2.0",
+                                   console=console, tee_gammaos=b"TEE-NEW", tee_stock=b"TEE-STOCK")
+        imgs = flashpkg.read_images(p, model)
+        assert imgs["tee_gammaos"] == b"TEE-NEW" and imgs["tee_stock"] == b"TEE-STOCK"
+        assert imgs["version"] == "1.2.0" and imgs["model"] is model and "gammaos" in imgs and "stock" in imgs
+    # an older package has neither, and that is fine
+    old = flashpkg.read_images(pkg.make_flash_package(str(tmp_path / "gammaos-pico-kpa-1.1.2-flash.zip"), "1.1.2"))
+    assert "tee_gammaos" not in old and "tee_stock" not in old and "gammaos" in old
+    # the secure firmware is checked against the package's SHA256SUMS like the LK
+    bad = pkg.make_flash_package(str(tmp_path / "bad-tee.zip"), tee_gammaos=b"TEE-NEW", bad_sum=True)
+    with pytest.raises(flashpkg.FlashPackageError):
+        flashpkg.read_images(bad)
+
+
 def test_block_flash_package(tmp_path):
     p = pkg.make_flash_package(str(tmp_path / "gammaos-pico-block-1.0.2-flash.zip"), "1.0.2", console="block")
     imgs = flashpkg.read_images(p)

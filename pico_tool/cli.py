@@ -21,6 +21,10 @@ point on Linux). The consoles are the Konkr Pocket Advance ("kpa") and the Konkr
 ("block"): the console commands find out which one is connected, and setup and update download the
 card package of the console given with --console, or of the last one the tool saw (the Pocket
 Advance until then). Both consoles' card packages hold the same files.
+
+console flash and console stock write the bootloader (lk_a and lk_b) and, with a flash package from
+GammaOS Pico 1.2.0 on, the console's secure firmware too (tee_a and tee_b). An older package, or a
+single LK image given with --image, writes the bootloader only.
 """
 
 import argparse
@@ -424,7 +428,10 @@ def cmd_console(a):
                 _out("No backups in %s" % root)
             for b in items:
                 model = _backup_model(con, b)
-                parts = ", ".join("%s %s" % (p, _kind(b.get(p))) for p in model.partitions)
+                parts = ", ".join("%s %s" % (p, _kind(b.get(p))) for p in model.partitions if p in b)
+                tee = [p for p in model.tee_partitions if p in b]
+                if tee:
+                    parts += ", secure firmware (%s)" % models_text(tee)
                 _out("%s  %s  %s  %s  %s" % (b.get("date"), b.get("ident"), model.name, parts, b.get("path")))
             return 0
         if a.con_cmd == "detect":
@@ -445,16 +452,21 @@ def cmd_console(a):
         cancel = threading.Event()
         if a.con_cmd == "backup":
             path = con.backup_lk(link, root, cancel, _cprog)
-            _out("Backed up to %s" % path)
+            _out("Backed up. %s" % con.backup_text(path))
             return 0
-        images, what = _images_for(a, con, link)
+        images, what, tee_what, candidates = _images_for(a, con, link)
         _out(WARNING_TEXT)
-        if not _ensure_backup(con, link, root, cancel):
+        if not _ensure_backup(con, link, root, cancel, candidates):
             return 1
-        if not _confirm("Write %s to %s of this %s?" % (what, link.model.partitions_text, link.model.name), a.yes):
+        if not _confirm(_write_question(images, what, tee_what, link.model), a.yes):
             return 1
-        con.write_lk(link, images, cancel, _cprog, verify=True)
-        _out("Done: %s is on the console. Restart it (hold Power) with the card in." % what)
+        results = con.write_lk(link, images, cancel, _cprog, verify=True)
+        for line in results_lines(results):
+            _out("  " + line)
+        if tee_what:
+            _out("Done: %s and %s are on the console. Restart it (hold Power) with the card in." % (what, tee_what))
+        else:
+            _out("Done: %s is on the console. Restart it (hold Power) with the card in." % what)
         return 0
     except con.ConsoleError as e:
         _err(str(e))
@@ -467,19 +479,43 @@ def _kind(part):
     return "%s%s" % (part.get("kind", "?"), (" " + part["version"]) if part.get("version") else "")
 
 
+def models_text(names):
+    from .console.models import names_text
+    return names_text(names)
+
+
+def results_lines(results):
+    from .console.models import results_lines as lines
+    return lines(results)
+
+
+def _write_question(images, what, tee_what, model):
+    """The one question before a write. It names every partition that gets written, and says so
+    when the secure firmware is written with the bootloader."""
+    from .console.models import lk_names, names_text, tee_names
+    lk, tee = lk_names(images, model), tee_names(images, model)
+    if not tee:
+        return "Write %s to %s of this %s?" % (what, names_text(lk), model.name)
+    return ("Write %s to %s of this %s, and %s to %s?"
+            % (what, names_text(lk), model.name, tee_what, names_text(tee)))
+
+
 WARNING_TEXT = ("GammaOS Pico is a custom bootloader: experimental, with no warranty. Writing a bootloader can "
                 "leave the console unable to start. Android's OTA updates may stop working while it is "
                 "installed. Keep the console charged and connected until this ends.")
 
 
-def _ensure_backup(con, link, root, cancel):
-    """The console's bootloader is backed up before the first write (and after any write it has none)."""
+def _ensure_backup(con, link, root, cancel, candidates=None):
+    """The console's bootloader is backed up before the first write (and after any write it has none),
+    with its secure firmware when the console's bootloader can read that. `candidates` are the
+    images in hand ({partition: [images]}): on a console that cannot send its data in one piece
+    they save reading what the tool already has a few bytes at a time."""
     mine = [b for b in con.list_backups(root) if b.get("ident") == link.ident]
     if mine:
         return True
     _out("This console has no backup yet: backing up its bootloader first...")
-    path = con.backup_lk(link, root, cancel, _cprog)
-    _out("Backed up to %s" % path)
+    path = con.backup_lk(link, root, cancel, _cprog, candidates=candidates)
+    _out("Backed up. %s" % con.backup_text(path))
     return True
 
 
@@ -491,19 +527,25 @@ def _backup_model(con, entry):
 
 
 def _images_for(a, con, link):
-    """{partition: image} for the connected console (lk_a and lk_b, or lk_a alone on the Pocket
-    Block), and a few words for what it is. Anything for the other console is refused here."""
+    """({partition: image}, a few words for the bootloader, a few words for the secure firmware or
+    None, {partition: [images it may hold now]} for the backup) for the connected console: the LK for lk_a and lk_b, and the secure firmware for tee_a and
+    tee_b when the flash package (1.2.0 and later) or the backup has it. Anything for the other
+    console, and a secure firmware file that is not one, is refused here."""
     from .release import flashpkg
     model = link.model
     if a.con_cmd == "restore":
-        return con.read_backup(a.backup, model), "the backup from %s" % a.backup
+        images = con.read_backup(a.backup, model)
+        has_tee = any(p in images for p in model.tee_partitions)
+        return (images, "the backup from %s" % a.backup, ("its secure firmware" if has_tee else None),
+                {p: [data] for p, data in images.items()})
     if getattr(a, "image", None):
         with open(a.image, "rb") as f:
             data = f.read()
         info = con.check_lk_image(data, model)
         if info.problems:
             raise CliError("; ".join(info.problems))
-        return {p: data for p in model.partitions}, "%s (%s)" % (os.path.basename(a.image), info.kind)
+        return ({p: data for p in model.partitions}, "%s (%s)" % (os.path.basename(a.image), info.kind), None,
+                {p: [data] for p in model.partitions})
     zp = a.zip or _latest_flash(model)
     imgs = flashpkg.read_images(zp, model)
     key = "stock" if a.con_cmd == "stock" else "gammaos"
@@ -513,7 +555,27 @@ def _images_for(a, con, link):
     if info.problems:
         raise CliError("; ".join(info.problems))
     label = "the stock bootloader" if key == "stock" else "GammaOS Pico %s" % (info.version or imgs.get("version") or "")
-    return {p: imgs[key] for p in model.partitions}, label.strip()
+    images = {p: imgs[key] for p in model.partitions}
+    candidates = _candidates(imgs, model)
+    tee_what = None
+    tee = imgs.get("tee_" + key)
+    if tee is not None:
+        problems = con.check_tee_image(tee).problems
+        if problems:
+            raise CliError("the flash package's secure firmware is refused, so nothing was written: %s"
+                           % "; ".join(problems))
+        images.update({p: tee for p in model.tee_partitions})
+        tee_what = "the stock secure firmware" if key == "stock" else "its secure firmware"
+    return images, label.strip(), tee_what, candidates
+
+
+def _candidates(imgs, model):
+    """{partition: [the flash package's images for it]}: what the console most likely holds."""
+    lk = [imgs[k] for k in ("gammaos", "stock") if k in imgs]
+    tee = [imgs[k] for k in ("tee_gammaos", "tee_stock") if k in imgs]
+    out = {p: lk for p in model.partitions}
+    out.update({p: tee for p in model.tee_partitions if tee})
+    return out
 
 
 def _latest_flash(model):
@@ -645,7 +707,7 @@ def build_parser():
     s.add_argument("--system")
     c.set_defaults(func=cmd_art)
 
-    c = sub.add_parser("console", help="the console's bootloader over USB (fastboot): Konkr Pocket Advance or "
+    c = sub.add_parser("console", help="the console's bootloader and secure firmware over USB (fastboot): Konkr Pocket Advance or "
                                        "Konkr Pocket Block, found out by itself")
     csub = c.add_subparsers(dest="con_cmd", metavar="ACTION")
     csub.required = True
@@ -653,10 +715,14 @@ def build_parser():
     csub.add_parser("drivers", help="USB setup help for this system")
     s = csub.add_parser("backups", help="list the bootloader backups")
     s.add_argument("--dest", help="the backup folder")
-    s = csub.add_parser("backup", help="back up the bootloader (lk_a and lk_b; lk_a on the Pocket Block)")
+    s = csub.add_parser("backup", help="back up the bootloader (lk_a and lk_b), and the secure firmware (tee_a and "
+                                       "tee_b) when the console runs GammaOS Pico 1.2.0 or later; on a console "
+                                       "that cannot send its data in one piece over USB (the Pocket Block since "
+                                       "1.1.0) this takes a few minutes")
     s.add_argument("--dest", help="the backup folder")
     s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
-    s = csub.add_parser("flash", help="install or update GammaOS Pico's bootloader")
+    s = csub.add_parser("flash", help="install or update GammaOS Pico's bootloader; a flash package from 1.2.0 on "
+                                      "also writes the secure firmware (tee_a and tee_b)")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--zip", help="a flash package for the connected console (gammaos-pico-kpa-<version>-flash.zip "
                                  "or gammaos-pico-block-<version>-flash.zip)")
@@ -665,12 +731,13 @@ def build_parser():
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--dest", help="the backup folder")
     s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
-    s = csub.add_parser("restore", help="write a backup back")
+    s = csub.add_parser("restore", help="write a backup back (the secure firmware too when the backup holds it)")
     s.add_argument("backup", help="the backup's folder")
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--dest", help="the backup folder")
     s.add_argument("--serial", help="the console's id (from detect), when more than one is connected")
-    s = csub.add_parser("stock", help="put the stock bootloader back")
+    s = csub.add_parser("stock", help="put the stock bootloader back, and the stock secure firmware when the flash "
+                                      "package has it (1.2.0 and later)")
     g = s.add_mutually_exclusive_group()
     g.add_argument("--zip", help="a flash package")
     g.add_argument("--latest", action="store_true")

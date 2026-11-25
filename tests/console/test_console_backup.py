@@ -39,8 +39,10 @@ def test_backup_round_trip(bus, tmp_path):
         assert record[name]["size"] == 0x200000
         assert record[name]["kind"] == kind
     assert record["lk_a"]["version"] == "1.0.0 abc1234"
-    # every partition read twice, each in two 1 MB steps
-    assert sum(1 for cmd in c.log if cmd.startswith("oem part-read:")) == 8
+    # every LK partition read twice, each in two 1 MB steps
+    assert sum(1 for cmd in c.log if cmd.startswith("oem part-read:lk_")) == 8
+    # this LK (1.0.0) refuses the secure firmware: asked once, never read
+    assert [cmd for cmd in c.log if cmd.startswith("oem part-read:tee_")] == ["oem part-read:tee_a"]
     assert [m for m in c.log if m.startswith(("download", "flash"))] == []
     fracs = [f for f, _ in marks if f is not None]
     assert fracs == sorted(fracs) and fracs[-1] == 1.0

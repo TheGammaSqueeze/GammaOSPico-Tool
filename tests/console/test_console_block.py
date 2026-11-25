@@ -1,5 +1,6 @@
 """The Konkr Pocket Block next to the Konkr Pocket Advance: identified by its product, its LK images
-told apart from the Pocket Advance's, and only lk_a ever read for a backup or written."""
+told apart from the Pocket Advance's. From 1.2.0 both of its LK copies are backed up and written,
+like the Pocket Advance's; a backup made before that holds lk_a only and still restores."""
 
 import json
 import os
@@ -129,23 +130,63 @@ def test_pocket_air_mini_still_refused_on_both(kind):
 
 # ---- backup ----
 
-def test_block_backup_reads_lk_a_only(bus, tmp_path):
+def test_block_backup_reads_both_copies(bus, tmp_path):
     c, link = block(bus)
     c.partitions["lk_a"] = bytearray(make_lk_image("stock", seed=3, pad_to=0x200000, console="block"))
     folder = backup_lk(link, str(tmp_path), threading.Event(), None)
-    assert sorted(os.listdir(folder)) == ["backup.json", "lk_a.img"]
-    assert not any(cmd.startswith("oem part-read:lk_b") for cmd in c.log)
-    assert sum(1 for cmd in c.log if cmd.startswith("oem part-read:lk_a")) == 4   # twice, two 1 MB steps
+    assert sorted(os.listdir(folder)) == ["backup.json", "lk_a.img", "lk_b.img"]
+    for name in ("lk_a", "lk_b"):                                                  # twice, two 1 MB steps
+        assert sum(1 for cmd in c.log if cmd.startswith("oem part-read:" + name)) == 4
     record = json.load(open(os.path.join(folder, "backup.json")))
-    assert set(record) == {"ident", "date", "model", "lk_a", "tool"}
+    assert set(record) == {"ident", "date", "model", "lk_a", "lk_b", "tool"}
     assert record["model"] == "block" and record["lk_a"]["kind"] == "stock"
+    assert record["lk_b"]["kind"] == "gammaos-pico"
     (entry,) = list_backups(str(tmp_path))
     assert entry["ok"] and entry["model"] == "block" and backup_model(entry) is BLOCK
-    assert set(read_backup(folder)) == {"lk_a"}
-    assert set(read_backup(folder, BLOCK)) == {"lk_a"}
+    assert set(read_backup(folder)) == {"lk_a", "lk_b"}
+    assert set(read_backup(folder, BLOCK)) == {"lk_a", "lk_b"}
     with pytest.raises(ConsoleError) as e:
         read_backup(folder, KPA)
     assert "made from a Konkr Pocket Block, not this Konkr Pocket Advance" in str(e.value)
+
+
+def test_block_lk_b_as_the_factory_left_it(bus, tmp_path):
+    """The factory never writes the Pocket Block's lk_b. It is backed up as it is, and left out
+    when the backup is restored: there is no bootloader in it to put back."""
+    c, link = block(bus)
+    c.partitions["lk_a"] = bytearray(make_lk_image("stock", seed=3, pad_to=0x200000, console="block"))
+    c.partitions["lk_b"] = bytearray(0x200000)
+    folder = backup_lk(link, str(tmp_path), None, None)
+    record = json.load(open(os.path.join(folder, "backup.json")))
+    assert record["lk_b"]["kind"] == "unknown" and record["lk_b"]["size"] == 0x200000
+    (entry,) = list_backups(str(tmp_path))
+    assert entry["ok"]
+    images = read_backup(folder, BLOCK)
+    assert set(images) == {"lk_a"}
+    write_lk(link, {"lk_a": BLOCK_NEW, "lk_b": BLOCK_NEW}, None, None)
+    assert write_lk(link, images, None, None) == {"lk_a": "verified"}
+    assert bytes(c.partitions["lk_a"]) == images["lk_a"] and bytes(c.partitions["lk_b"]) == BLOCK_NEW
+
+
+def test_block_backup_made_before_1_2_0_holds_lk_a_only(bus, tmp_path):
+    """Up to 1.1.x the tool backed up and wrote lk_a alone on the Pocket Block: such a backup still
+    lists as intact, loads and restores."""
+    c, link = block(bus)
+    c.partitions["lk_a"] = bytearray(make_lk_image("stock", seed=3, pad_to=0x200000, console="block"))
+    folder = backup_lk(link, str(tmp_path), None, None)
+    path = os.path.join(folder, "backup.json")
+    record = json.load(open(path))
+    del record["lk_b"]
+    record["tool"] = "1.1.2"
+    json.dump(record, open(path, "w"))
+    os.remove(os.path.join(folder, "lk_b.img"))
+    (entry,) = list_backups(str(tmp_path))
+    assert entry["ok"] and entry["problems"] == []
+    images = read_backup(folder, BLOCK)
+    assert set(images) == {"lk_a"}
+    write_lk(link, {"lk_a": BLOCK_NEW, "lk_b": BLOCK_NEW}, None, None)
+    assert write_lk(link, images, None, None) == {"lk_a": "verified"}
+    assert bytes(c.partitions["lk_a"]) == images["lk_a"]
 
 
 def test_old_backup_without_model_is_a_kpa_backup(bus, tmp_path):
@@ -175,13 +216,13 @@ def test_backup_of_an_unknown_model_is_not_used(tmp_path):
 
 # ---- writing ----
 
-def test_block_update_writes_lk_a_only(bus):
+def test_block_update_writes_both_copies(bus):
     c, link = block(bus)
-    old_b = bytes(c.partitions["lk_b"])
-    assert write_lk(link, {"lk_a": BLOCK_NEW}, None, None) == {"lk_a": "verified"}
-    assert c.flashed == ["lk_a"]
-    assert bytes(c.partitions["lk_a"]) == BLOCK_NEW and bytes(c.partitions["lk_b"]) == old_b
-    assert not any("lk_b" in cmd for cmd in c.log)
+    assert BLOCK.partitions == ("lk_a", "lk_b")
+    assert write_lk(link, {"lk_a": BLOCK_NEW, "lk_b": BLOCK_NEW}, None, None) == {"lk_a": "verified",
+                                                                                 "lk_b": "verified"}
+    assert c.flashed == ["lk_b", "lk_a"]            # the copy it runs from (a) last
+    assert bytes(c.partitions["lk_a"]) == BLOCK_NEW and bytes(c.partitions["lk_b"]) == BLOCK_NEW
 
 
 def test_block_stock_restore(bus):
@@ -190,13 +231,11 @@ def test_block_stock_restore(bus):
     assert bytes(c.partitions["lk_a"][:len(BLOCK_STOCK)]) == BLOCK_STOCK
 
 
-def test_block_never_writes_lk_b(bus):
+def test_block_writes_nothing_but_its_lk_and_tee_copies(bus):
     c, link = block(bus)
     with pytest.raises(ConsoleError) as e:
-        write_lk(link, {"lk_a": BLOCK_NEW, "lk_b": BLOCK_NEW}, None, None)
-    assert "written to lk_a only, not lk_b" in str(e.value)
-    with pytest.raises(ConsoleError):
-        write_lk(link, {"lk_b": BLOCK_NEW}, None, None)
+        write_lk(link, {"lk_a": BLOCK_NEW, "boot_a": BLOCK_NEW}, None, None)
+    assert "Only lk_a, lk_b, tee_a and tee_b can be written, not boot_a" in str(e.value)
     assert writes(c) == []
 
 
@@ -228,8 +267,9 @@ def test_block_failed_readback_wording(bus):
         write_lk(link, {"lk_a": BLOCK_NEW}, None, None)
     text = str(e.value)
     assert "lk_a did not read back correctly" in text
-    assert "lk_b" not in text
-    assert "Do not turn the console off" in text and "gammaos-pico-block-<version>-flash.zip" in text
+    assert "lk_b was not touched. Do not turn the console off" in text
+    assert "still starts" not in text
+    assert "gammaos-pico-block-<version>-flash.zip" in text
 
 
 def test_block_flash_fail_wording(bus):
@@ -238,7 +278,8 @@ def test_block_flash_fail_wording(bus):
     with pytest.raises(ConsoleError) as e:
         write_lk(link, {"lk_a": BLOCK_NEW}, None, None)
     text = str(e.value)
-    assert "Writing lk_a did not finish" in text and "lk_b" not in text
+    assert "Writing lk_a did not finish" in text and "lk_b was not touched." in text
+    assert "still starts" not in text
 
 
 # ---- the real images, when they are on this machine ----

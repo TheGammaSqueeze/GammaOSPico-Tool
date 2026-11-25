@@ -100,6 +100,7 @@ class FastbootSession:
     def __init__(self, transport: Transport):
         self.t = transport
         self.broken = False   # set once the stream may be out of step; nothing more is sent
+        self.upload_refused = False   # set once the console said it has no `upload` (see device.py)
 
     def close(self) -> None:
         try:

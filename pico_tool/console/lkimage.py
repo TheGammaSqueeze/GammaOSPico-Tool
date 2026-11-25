@@ -1,4 +1,5 @@
-"""Checks on an LK image before it is written to a console's lk_a (and lk_b).
+"""Checks on an LK image before it is written to a console's lk_a and lk_b, and on a secure
+firmware ("tee") image before it is written to tee_a and tee_b.
 
 A MediaTek LK image is a chain of parts. Each part starts with a 512 byte header:
 
@@ -29,6 +30,11 @@ Which console an image is for comes from that project, and the image must also c
 console's display driver (st7123p_hd640_boe on the Pocket Advance, jd9168s_960x720 on the Pocket
 Block): the AYANEO Pocket Air Mini uses the same k85v1_64 board name with another panel, and its LK
 would leave a Pocket Advance dark. See models.py.
+
+The secure firmware image uses the same part headers; its first part is named "atf" where an LK
+image has "lk". That name is what keeps one from ever being written to the other's partitions. The
+image is far smaller than its partition (about 160 KB in 5 to 12 MB) and says nothing the tool can
+read about which console it is for: that comes from the flash package it is taken from.
 """
 
 from __future__ import annotations
@@ -44,6 +50,8 @@ PART_MAGIC = 0x58881688
 EXT_MAGIC = 0x58891689
 HEADER_SIZE = 512
 LK_PARTITION_SIZE = max(m.lk_size for m in MODELS)   # lk_a and lk_b, from the stock scatters
+TEE_MAX_SIZE = 0x1000000                              # no tee partition is larger than 16 MB
+TEE_FIRST_PART = "atf"
 PICO_VAR_NAME = b"version-gammaos-pico\x00"
 
 # <project>-<commit>-<commit date>-<build date>, the LK_VER_TAG every LK of these consoles carries
@@ -145,6 +153,10 @@ def check_lk_image(data: bytes, model: Optional[ConsoleModel] = None) -> LkImage
         return info
     names = [p.name for p in parts]
     lk = parts[0]
+    if lk.name == TEE_FIRST_PART:
+        info.problems.append("This is a secure firmware (tee) image, not a bootloader: it is never written to "
+                             "the bootloader's partitions.")
+        return info
     if lk.name != "lk":
         info.problems.append("The image starts with a '%s' part, not the 'lk' part a bootloader has." % lk.name)
         return info
@@ -192,4 +204,42 @@ def check_lk_image(data: bytes, model: Optional[ConsoleModel] = None) -> LkImage
 
     if model is not None and info.model is not None and info.model is not model:
         info.problems.append("This bootloader is for the %s, not this %s." % (info.model.name, model.name))
+    return info
+
+
+@dataclass
+class TeeImageInfo:
+    size: int
+    problems: List[str] = field(default_factory=list)   # empty = OK to write to tee_a and tee_b
+
+
+def check_tee_image(data: bytes) -> TeeImageInfo:
+    """Say whether a file is a secure firmware (tee) image: MediaTek part headers with "atf" first.
+    A bootloader image, or anything else, is refused."""
+    info = TeeImageInfo(size=len(data))
+    if not data:
+        info.problems.append("The file is empty.")
+        return info
+    if len(data) > TEE_MAX_SIZE:
+        info.problems.append("The file is %d bytes, larger than any secure firmware partition." % len(data))
+    parts, problem = _walk_parts(data)
+    if not parts:
+        if problem and "too small" in problem:
+            info.problems.append("The file is too small to be a secure firmware image.")
+        elif problem and "cut short" in problem:
+            info.problems.append(problem[0].upper() + problem[1:] + ".")
+        else:
+            info.problems.append("The file is not a secure firmware image (no MediaTek header at the start).")
+        return info
+    first = parts[0].name
+    if first == "lk":
+        info.problems.append("This is a bootloader (LK) image, not the secure firmware: it is never written to "
+                             "the secure firmware's partitions.")
+        return info
+    if first != TEE_FIRST_PART:
+        info.problems.append("The image starts with a '%s' part, not the 'atf' part the secure firmware has."
+                             % first)
+        return info
+    if problem:
+        info.problems.append(problem[0].upper() + problem[1:] + ".")
     return info

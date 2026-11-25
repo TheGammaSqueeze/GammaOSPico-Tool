@@ -3,7 +3,9 @@ console flows (no USB involved): one console on "fastboot" (a Konkr Pocket Advan
 Pocket Block with state.model = BLOCK), backups in a folder, writes recorded.
 
 Images: b"LKIMG:<kind>:<version>:" then b"block:" for a Pocket Block image (anything else is a
-Pocket Advance one); b"STOCKLK" (Pocket Advance) and b"STOCKBLK" (Pocket Block) are stock."""
+Pocket Advance one); b"STOCKLK" (Pocket Advance) and b"STOCKBLK" (Pocket Block) are stock.
+A secure firmware image starts with b"TEEIMG:"; state.tee_read says whether this console's
+bootloader can read tee_a and tee_b back (GammaOS Pico 1.2.0 and later)."""
 
 import hashlib
 import json
@@ -44,9 +46,28 @@ class State(object):
         self.present = True
         self.model = KPA
         self.lk = {"lk_a": b"STOCKLK" * 100, "lk_b": b"STOCKLK" * 100}
+        self.tee = {"tee_a": tee_image("stock"), "tee_b": tee_image("stock")}
+        self.tee_read = False
+        self.backup_candidates = None
         self.writes = []
         self.backup_root = None
         self.fail_write = None
+
+
+def tee_image(kind="gammaos"):
+    return ("TEEIMG:%s:" % kind).encode() + b"\0" * 64
+
+
+@dataclass
+class TeeImageInfo:
+    size: int
+    problems: List[str] = field(default_factory=list)
+
+
+def check_tee_image(data):
+    if data.startswith(b"TEEIMG:"):
+        return TeeImageInfo(len(data))
+    return TeeImageInfo(len(data), ["The file is not a secure firmware image."])
 
 
 state = State()
@@ -105,7 +126,8 @@ def default_backup_root():
     return state.backup_root or os.path.join(os.path.expanduser("~"), "GammaOS Pico Backups")
 
 
-def backup_lk(link, dest_root, cancel, progress):
+def backup_lk(link, dest_root, cancel, progress, candidates=None):
+    state.backup_candidates = candidates
     if cancel.is_set():
         raise ConsoleError("Cancelled.")
     stamp = time.strftime("%Y-%m-%d_%H%M%S", time.gmtime())
@@ -124,9 +146,22 @@ def backup_lk(link, dest_root, cancel, progress):
         info = check_lk_image(data)
         meta[part] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "kind": info.kind,
                       "version": info.version}
+    for part in link.model.tee_partitions if state.tee_read else ():
+        data = state.tee[part]
+        with open(os.path.join(d, part + ".img"), "wb") as f:
+            f.write(data)
+        meta[part] = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "kind": "secure-firmware"}
     with open(os.path.join(d, "backup.json"), "w") as f:
         json.dump(meta, f)
     return d
+
+
+def backup_text(path):
+    with open(os.path.join(path, "backup.json")) as f:
+        meta = json.load(f)
+    if "tee_a" in meta:
+        return "The console's bootloader and secure firmware are saved in %s" % path
+    return "The console's bootloader is saved in %s\nThe secure firmware was not backed up." % path
 
 
 def list_backups(dest_root):
@@ -158,29 +193,45 @@ def read_backup(path, model=None):
     if model is not None and made_from is not model:
         raise ConsoleError("The backup was made from a %s, not this %s." % (made_from.name, model.name))
     out = {}
-    for part in made_from.partitions:
+    for part in made_from.all_partitions:
+        if part not in meta:
+            continue          # an older backup, or the secure firmware could not be read
         with open(os.path.join(path, part + ".img"), "rb") as f:
-            out[part] = f.read()
-        if hashlib.sha256(out[part]).hexdigest() != meta[part]["sha256"]:
+            data = f.read()
+        if hashlib.sha256(data).hexdigest() != meta[part]["sha256"]:
             raise ConsoleError("%s.img does not match backup.json: the backup is damaged." % part)
+        if (part in made_from.partitions and part not in made_from.backup_always
+                and check_lk_image(data, made_from).problems):
+            continue          # the Pocket Block's lk_b as the factory left it: nothing to put back
+        out[part] = data
     return out
 
 
 def write_lk(link, images, cancel, progress, verify=True):
-    if set(images) - set(link.model.partitions):
-        raise ConsoleError("Only %s can be written." % link.model.partitions_text)
+    model = link.model
+    if set(images) - set(model.all_partitions):
+        raise ConsoleError("Only %s can be written." % models.names_text(model.all_partitions))
     for part, data in images.items():
-        if check_lk_image(data, link.model).problems:
+        if part in model.tee_partitions:
+            bad = check_tee_image(data).problems
+        else:
+            bad = check_lk_image(data, model).problems
+        if bad:
             raise ConsoleError("The image for %s is refused." % part)
     if cancel.is_set():
         raise ConsoleError("Cancelled before anything was written.")
     if state.fail_write:
         raise ConsoleError(state.fail_write)
-    for part, data in images.items():
+    results = {}
+    order = [p for p in model.tee_partitions if p in images] + [p for p in model.partitions if p in images]
+    for part in order:
+        data = images[part]
         progress(0.5, "Writing %s" % part)
-        state.lk[part] = data
+        (state.tee if part in model.tee_partitions else state.lk)[part] = data
         state.writes.append((part, hashlib.sha256(data).hexdigest()))
+        results[part] = "written" if part in model.tee_partitions and not state.tee_read else "verified"
     progress(1.0, "Checked")
+    return results
 
 
 def driver_help():

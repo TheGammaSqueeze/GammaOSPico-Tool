@@ -1,4 +1,5 @@
-"""Finding the console on USB, telling it apart from other fastboot devices, and reading lk_a/lk_b.
+"""Finding the console on USB, telling it apart from other fastboot devices, and reading lk_a/lk_b
+(and tee_a/tee_b where the console's LK allows it).
 
 A device is accepted when its fastboot answers getvar:product with the project GammaOS Pico's LK is
 built as for one of the consoles in models.py: "k85v1_64_kpa" (Konkr Pocket Advance) or
@@ -14,9 +15,10 @@ import re
 import sys
 import threading
 import time
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .errors import ConsoleCancelled, ConsoleError, ConsoleTooOld, TOO_OLD_TO_READ
 from .fastboot import FastbootFail, FastbootSession, LinkError, ProtocolError, READ_TIMEOUT_MS
@@ -26,6 +28,7 @@ from .usb import Candidate, UsbBus
 Progress = Callable[[Optional[float], str], None]
 
 LK_PARTITIONS = ("lk_a", "lk_b")       # every LK copy that can be read; models.py says which are written
+TEE_PARTITIONS = ("tee_a", "tee_b")    # the secure firmware copies; read by GammaOS Pico 1.2.0 and later
 BOOTLOADER_HINT = "hold SELECT + START + R while turning it on"
 
 
@@ -361,6 +364,19 @@ def supports_part_read(session: FastbootSession) -> bool:
         raise
 
 
+def supports_tee_read(session: FastbootSession) -> bool:
+    """True when the LK's `oem part-read` also reads tee_a and tee_b (GammaOS Pico 1.2.0 and later).
+    An older LK refuses those names ("only lk_a and lk_b"), or has no part-read at all."""
+    try:
+        session.run("oem part-read:" + TEE_PARTITIONS[0], READ_TIMEOUT_MS)
+        return True
+    except FastbootFail as fail:
+        text = fail.text.lower()
+        if _is_unknown_command(fail) or "only lk_a and lk_b" in text:
+            return False
+        raise
+
+
 def partition_size(session: FastbootSession, name: str) -> Optional[int]:
     """getvar:partition-size:<name> (hex, with or without 0x), or None when not published."""
     value = session.getvar_or_none("partition-size:" + name)
@@ -372,54 +388,275 @@ def partition_size(session: FastbootSession, name: str) -> Optional[int]:
         return None
 
 
+class UploadRefused(Exception):
+    """The console has no `upload`, and the caller asked not to read the slow way."""
+
+
+def _stage(session: FastbootSession, name: str, offset: int, size: Optional[int]) -> Tuple[int, int]:
+    """`oem part-read:<name>:<offset>`: the LK stages up to 1 MB of the partition from there.
+    Returns (partition size, bytes staged)."""
+    command = "oem part-read:%s:0x%x" % (name, offset)
+    try:
+        reply = session.run(command, READ_TIMEOUT_MS)
+    except FastbootFail as fail:
+        if _is_unknown_command(fail):
+            raise ConsoleTooOld(TOO_OLD_TO_READ) from fail
+        raise
+    found = None
+    for line in reply.infos:
+        m = _PART_INFO.fullmatch(line.strip())
+        if m:
+            found = m
+    if not found:
+        raise ProtocolError("part-read gave no size line")
+    got_name = found.group(1)
+    got_size, got_off, got_len = (int(found.group(i), 16) for i in (2, 3, 4))
+    if got_name != name or got_off != offset:
+        raise ProtocolError("part-read answered for %s at 0x%x" % (got_name, got_off))
+    if got_size <= 0 or got_size > MAX_PART_SIZE or got_len <= 0 or got_off + got_len > got_size:
+        raise ProtocolError("part-read sizes do not add up (size 0x%x len 0x%x)" % (got_size, got_len))
+    if size is not None and got_size != size:
+        raise ProtocolError("partition size changed between reads")
+    return got_size, got_len
+
+
 def read_partition(session: FastbootSession, name: str, limit: Optional[int] = None,
                    cancel: Optional[threading.Event] = None,
-                   on_bytes: Optional[Callable[[int, int], None]] = None) -> bytes:
-    """Read lk_a or lk_b in the steps the LK stages (1 MB each). With `limit`, stop once at least
-    that many bytes from the start are in hand. Raises ConsoleTooOld, FastbootFail, LinkError or
-    ProtocolError; callers turn those into sentences."""
-    if name not in LK_PARTITIONS:
-        raise ValueError("only lk_a and lk_b can be read")
+                   on_bytes: Optional[Callable[[int, int], None]] = None,
+                   candidates: Sequence[bytes] = (), info: Optional[dict] = None,
+                   staged_ok: bool = True) -> bytes:
+    """Read lk_a or lk_b (or tee_a or tee_b, see supports_tee_read) in the steps the LK stages (1 MB
+    each). With `limit`, stop once at least that many bytes from the start are in hand. Raises
+    ConsoleTooOld, FastbootFail, LinkError or ProtocolError; callers turn those into sentences.
+
+    A console that answers `upload` with "no upload on this console" (the Pocket Block since 1.1.0)
+    is read from checksums instead, see _read_without_upload: `candidates` are images the partition
+    may hold, which save fetching their bytes, and `info` (a dict) is filled with what that took.
+    With staged_ok False such a console raises UploadRefused instead."""
+    if name not in LK_PARTITIONS + TEE_PARTITIONS:
+        raise ValueError("only lk_a, lk_b, tee_a and tee_b can be read")
+    if session.upload_refused:
+        if not staged_ok:
+            raise UploadRefused()
+        return _read_without_upload(session, name, limit, cancel, on_bytes, candidates, info)
     out = bytearray()
     size: Optional[int] = None
     offset = 0
     while True:
         if cancel is not None and cancel.is_set():
             raise ConsoleCancelled("Cancelled.")
-        command = "oem part-read:%s:0x%x" % (name, offset)
-        try:
-            reply = session.run(command, READ_TIMEOUT_MS)
-        except FastbootFail as fail:
-            if _is_unknown_command(fail):
-                raise ConsoleTooOld(TOO_OLD_TO_READ) from fail
-            raise
-        found = None
-        for line in reply.infos:
-            m = _PART_INFO.fullmatch(line.strip())
-            if m:
-                found = m
-        if not found:
-            raise ProtocolError("part-read gave no size line")
-        got_name = found.group(1)
-        got_size, got_off, got_len = (int(found.group(i), 16) for i in (2, 3, 4))
-        if got_name != name or got_off != offset:
-            raise ProtocolError("part-read answered for %s at 0x%x" % (got_name, got_off))
-        if got_size <= 0 or got_size > MAX_PART_SIZE or got_len <= 0 or got_off + got_len > got_size:
-            raise ProtocolError("part-read sizes do not add up (size 0x%x len 0x%x)" % (got_size, got_len))
-        if size is None:
-            size = got_size
-        elif got_size != size:
-            raise ProtocolError("partition size changed between reads")
+        size, got_len = _stage(session, name, offset, size)
         target = size if limit is None else min(size, limit)
 
         def chunk_progress(done: int, _total: int, base=len(out)) -> None:
             if on_bytes:
                 on_bytes(min(base + done, target), target)
 
-        data = session.upload(READ_TIMEOUT_MS, chunk_progress)
+        try:
+            data = session.upload(READ_TIMEOUT_MS, chunk_progress)
+        except FastbootFail as fail:
+            if NO_UPLOAD_TEXT not in fail.text.lower():
+                raise
+            session.upload_refused = True
+            if not staged_ok:
+                raise UploadRefused() from fail
+            return _read_without_upload(session, name, limit, cancel, on_bytes, candidates, info)
         if len(data) != got_len:
             raise ProtocolError("upload sent %d bytes, part-read staged %d" % (len(data), got_len))
         out += data
         offset += got_len
         if offset >= size or (limit is not None and offset >= limit):
             return bytes(out)
+
+
+# ---- a console without `upload`: checksums of what part-read staged, and its bytes as text ----
+#
+# Since GammaOS Pico 1.1.0 the Pocket Block's LK answers `upload` with FAIL "no upload on this
+# console: oem stage-hex / stage-crc" (its USB cannot carry a bulk upload). It is told by that
+# answer, not by the model. What it offers on the data part-read just staged:
+#
+#   oem stage-crc:1000     INFO lines with the CRC-32 (zlib's) of every 4 KiB, six 8 digit hex words
+#                          to a line; the last one covers what is left
+#   oem stage-hex:OFF:LEN  INFO lines "%06x:" and up to 24 bytes as hex: about 24 bytes per USB
+#                          packet, so it is used only where the checksums cannot settle it
+
+NO_UPLOAD_TEXT = "no upload on this console"
+STAGE_CHUNK = 0x1000
+HEX_RUN = 0x4000                 # the most asked of one stage-hex command (683 INFO lines)
+SLOW_READ_LIMIT = 4 << 20        # past this much by stage-hex, the progress text says it takes long
+_CRC_WORD = re.compile(r"[0-9a-f]{8}")
+_HEX_LINE = re.compile(r"([0-9a-f]{6,8}):((?:[0-9a-f]{2}){1,24})")
+
+
+def stage_crcs(session: FastbootSession, length: int) -> List[int]:
+    """The CRC-32 of every 4 KiB of the `length` bytes part-read staged."""
+    reply = session.run("oem stage-crc:%x" % STAGE_CHUNK, READ_TIMEOUT_MS)
+    words = " ".join(reply.infos).split()
+    want = -(-length // STAGE_CHUNK)
+    if len(words) != want or not all(_CRC_WORD.fullmatch(w) for w in words):
+        raise ProtocolError("stage-crc gave %d checksums for %d chunks" % (len(words), want))
+    return [int(w, 16) for w in words]
+
+
+def stage_hex(session: FastbootSession, offset: int, length: int) -> bytes:
+    """`length` bytes at `offset` of what part-read staged, sent as text."""
+    out = bytearray()
+    while len(out) < length:
+        want = min(HEX_RUN, length - len(out))
+        start = offset + len(out)
+        reply = session.run("oem stage-hex:%x:%x" % (start, want), READ_TIMEOUT_MS)
+        got = bytearray()
+        for line in reply.infos:
+            m = _HEX_LINE.fullmatch(line.strip())
+            if not m or int(m.group(1), 16) != start + len(got):
+                raise ProtocolError("stage-hex sent a line the tool did not expect")
+            got += bytes.fromhex(m.group(2))
+        if len(got) != want:
+            raise ProtocolError("stage-hex sent %d bytes, %d were asked for" % (len(got), want))
+        out += got
+    return bytes(out)
+
+
+def _steps(session: FastbootSession, name: str, limit: Optional[int], cancel,
+           on_step: Optional[Callable[[int, int], None]] = None) -> Tuple[int, List[Tuple[int, int, List[int]]]]:
+    """Stage the partition step by step and collect each step's checksums. Returns (partition
+    size, [(offset, length, checksums), ...])."""
+    steps: List[Tuple[int, int, List[int]]] = []
+    size: Optional[int] = None
+    offset = 0
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise ConsoleCancelled("Cancelled.")
+        size, got_len = _stage(session, name, offset, size)
+        steps.append((offset, got_len, stage_crcs(session, got_len)))
+        offset += got_len
+        if on_step:
+            on_step(offset, size)
+        if offset >= size or (limit is not None and offset >= limit):
+            return size, steps
+
+
+def partition_crcs(session: FastbootSession, name: str, limit: Optional[int] = None,
+                   cancel: Optional[threading.Event] = None,
+                   on_bytes: Optional[Callable[[int, int], None]] = None) -> List[int]:
+    """The checksums of every 4 KiB of a partition, asked afresh (a backup's second read)."""
+    def on_step(done: int, size: int) -> None:
+        if on_bytes:
+            target = size if limit is None else min(size, limit)
+            on_bytes(min(done, target), target)
+    _size, steps = _steps(session, name, limit, cancel, on_step)
+    return [crc for _off, _len, crcs in steps for crc in crcs]
+
+
+def _read_without_upload(session: FastbootSession, name: str, limit: Optional[int], cancel,
+                         on_bytes, candidates: Sequence[bytes], info: Optional[dict]) -> bytes:
+    """Build the partition's bytes from checksums. A 4 KiB chunk whose CRC-32 equals that of the
+    same chunk of a candidate image (zero padded), or of a chunk of zeros or of 0xFF, is taken from
+    there; every other chunk is fetched with stage-hex and checked against its CRC-32.
+
+    `info` gets "crcs" (every chunk's checksum, for the caller's second read), "slow_total" and
+    "slow_done" (bytes that had to come by stage-hex)."""
+    if info is None:
+        info = {}
+
+    def scanned(done: int, size: int) -> None:
+        if on_bytes:
+            target = size if limit is None else min(size, limit)
+            on_bytes(min(done, target) // 10, target)
+
+    size, steps = _steps(session, name, limit, cancel, scanned)
+    target = size if limit is None else min(size, limit)
+    plain: Dict[Tuple[int, int], int] = {}       # (fill byte, length) -> checksum
+
+    def known(at: int, length: int, crc: int) -> Optional[bytes]:
+        for fill in (0x00, 0xFF):
+            if (fill, length) not in plain:
+                plain[(fill, length)] = zlib.crc32(bytes([fill]) * length)
+            if plain[(fill, length)] == crc:
+                return bytes([fill]) * length
+        for image in candidates:
+            piece = bytes(image[at:at + length]).ljust(length, b"\x00")
+            if at < len(image) and zlib.crc32(piece) == crc:
+                return piece
+        return None
+
+    # what each chunk is, where the checksums settle it; the rest is fetched below
+    pieces: List[List[Optional[bytes]]] = []
+    slow_total = 0
+    for offset, length, crcs in steps:
+        row: List[Optional[bytes]] = []
+        for j, crc in enumerate(crcs):
+            clen = min(STAGE_CHUNK, length - j * STAGE_CHUNK)
+            piece = known(offset + j * STAGE_CHUNK, clen, crc)
+            if piece is None:
+                slow_total += clen
+            row.append(piece)
+        pieces.append(row)
+    info.update(crcs=[crc for _o, _l, crcs in steps for crc in crcs], slow_total=slow_total, slow_done=0)
+
+    def fetched() -> None:
+        if on_bytes:
+            share = info["slow_done"] / slow_total if slow_total else 1.0
+            on_bytes(int(target * (0.1 + 0.9 * share)), target)
+
+    for (offset, length, crcs), row in zip(steps, pieces):
+        missing = [j for j, piece in enumerate(row) if piece is None]
+        if not missing:
+            continue
+        _stage(session, name, offset, size)
+        again = stage_crcs(session, length)
+        if again != crcs:
+            raise ProtocolError("the checksums of %s changed between two reads" % name)
+        for j in missing:
+            if cancel is not None and cancel.is_set():
+                raise ConsoleCancelled("Cancelled.")
+            clen = min(STAGE_CHUNK, length - j * STAGE_CHUNK)
+            piece = stage_hex(session, j * STAGE_CHUNK, clen)
+            if zlib.crc32(piece) != crcs[j]:
+                piece = stage_hex(session, j * STAGE_CHUNK, clen)      # once more, then give up
+                if zlib.crc32(piece) != crcs[j]:
+                    raise ProtocolError("the bytes read from %s do not match their checksum" % name)
+            row[j] = piece
+            info["slow_done"] += clen
+            fetched()
+    if on_bytes:
+        on_bytes(target, target)
+    return b"".join(piece for row in pieces for piece in row)
+
+
+def partition_matches(session: FastbootSession, name: str, data: bytes,
+                      cancel: Optional[threading.Event] = None,
+                      on_bytes: Optional[Callable[[int, int], None]] = None) -> bool:
+    """True when the partition starts with `data` (the read back after a write; only the image's
+    length is looked at). With `upload` the bytes are fetched and compared. Without it, each 1 MB
+    step the image covers is compared by the CRC-32 of its 4 KiB chunks; the chunk the image ends
+    in, where what follows on the console is not known, has the image's part fetched with stage-hex
+    and compared byte for byte."""
+    if not session.upload_refused:
+        try:
+            back = read_partition(session, name, limit=len(data), cancel=cancel, on_bytes=on_bytes,
+                                  staged_ok=False)
+            return len(back) >= len(data) and back[:len(data)] == data
+        except UploadRefused:
+            pass
+    size: Optional[int] = None
+    offset = 0
+    while offset < len(data):
+        size, length = _stage(session, name, offset, size)
+        crcs = stage_crcs(session, length)
+        for j, crc in enumerate(crcs):
+            at = offset + j * STAGE_CHUNK
+            if at >= len(data):
+                break
+            clen = min(STAGE_CHUNK, length - j * STAGE_CHUNK)
+            if at + clen <= len(data):
+                if zlib.crc32(data[at:at + clen]) != crc:
+                    return False
+            elif stage_hex(session, j * STAGE_CHUNK, len(data) - at) != data[at:]:
+                return False
+        offset += length
+        if on_bytes:
+            on_bytes(min(offset, len(data)), len(data))
+        if offset >= size:
+            break
+    return offset >= len(data)

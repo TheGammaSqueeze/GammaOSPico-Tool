@@ -1,6 +1,7 @@
 """The Console tab: GammaOS Pico's bootloader over USB (fastboot) - back it up, install or update it,
-restore a backup or the stock bootloader. The connected console says which it is (Konkr Pocket
-Advance or Konkr Pocket Block); what is read and written, and which packages fit, follow from that."""
+restore a backup or the stock bootloader. From GammaOS Pico 1.2.0 a flash package also carries the
+console's secure firmware, written with the bootloader. The connected console says which it is
+(Konkr Pocket Advance or Konkr Pocket Block); which packages fit follows from that."""
 
 import os
 import subprocess
@@ -10,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog
 
 from ... import WIKI_INSTALLING
-from ...console.models import MODELS, by_key
+from ...console.models import MODELS, by_key, lk_names, names_text, results_lines, tee_names
 from ...release import flashpkg, github
 from .. import images, theme, widgets
 from ..app import Page
@@ -226,22 +227,25 @@ class ConsolePage(Page):
             w.destroy()
         ready = con is not None and self.link is not None and not self.busy
         rel = self.app.release
-        if self.link is not None:
-            copies = self.link.model.partitions_text
-        else:
-            copies = " or ".join("%s (%s)" % (m.partitions_text, m.name.replace("Konkr ", "")) for m in MODELS)
+        model = self.link.model if self.link is not None else MODELS[0]
+        copies, tee = model.partitions_text, model.tee_partitions_text
         rows = (
-            ("shield", "Back up the bootloader", "Saves %s from the console to this computer." % copies,
+            ("shield", "Back up the bootloader",
+             "Saves %s from the console to this computer, and its secure firmware (%s) when the console runs "
+             "GammaOS Pico 1.2.0 or later. On a console that cannot send its data in one piece over USB (the "
+             "Pocket Block since 1.1.0) this takes a few minutes." % (copies, tee),
              "Back up", self.do_backup, "secondary"),
             ("download", "Install or update GammaOS Pico",
-             "The bootloader from the latest release%s, or from a flash package or image you pick. A console "
-             "with no backup here is backed up first." % ((" (" + rel.version + ")") if rel else ""),
+             "The bootloader from the latest release%s, or from a flash package or image you pick. From 1.2.0 "
+             "the flash package also has the console's secure firmware (%s), which is written with it. A console "
+             "with no backup here is backed up first." % ((" (" + rel.version + ")") if rel else "", tee),
              "Install...", self.do_install, "primary"),
             ("restore", "Restore a backup", "Writes a backup made with this tool back to the console.",
              "Restore...", self.do_restore, "secondary"),
             ("chip", "Restore the stock bootloader",
-             "Puts the console's own bootloader back (from the flash package): it then starts Android as from the "
-             "factory, and Android's OTA updates work again.", "Restore stock...", self.do_stock, "secondary"),
+             "Puts the console's own bootloader back (from the flash package), with its own secure firmware when "
+             "the package has it (1.2.0 and later): it then starts Android as from the factory, and Android's OTA "
+             "updates work again.", "Restore stock...", self.do_stock, "secondary"),
         )
         for icon, title, text, btn, fn, kind in rows:
             r = tk.Frame(self.actions, bg=p.panel)
@@ -328,8 +332,11 @@ class ConsolePage(Page):
                 model = _backup_model(b)
                 widgets.label(t, ctx, "%s   \u00b7   %s %s" % (b.get("date", "?"), model.name, b.get("ident", "?")),
                               12).pack(anchor="w")
-                widgets.label(t, ctx, "   ".join("%s %s" % (part, _kind(b.get(part))) for part in model.partitions),
-                              11, color=p.dim).pack(anchor="w")
+                held = ["%s %s" % (part, _kind(b.get(part))) for part in model.partitions if part in b]
+                tee = [part for part in model.tee_partitions if part in b]
+                if tee:
+                    held.append("secure firmware (%s)" % names_text(tee))
+                widgets.label(t, ctx, "   ".join(held), 11, color=p.dim).pack(anchor="w")
                 if b.get("ok") is False:
                     widgets.label(t, ctx, "Damaged: " + "; ".join(b.get("problems") or []), 11,
                                   color=p.danger, wraplength=S(400)).pack(anchor="w", fill="x")
@@ -391,47 +398,63 @@ class ConsolePage(Page):
         def done(path):
             self._busy(False)
             self.app.status("Backed up to %s" % path)
-            widgets.tell(self.app, "Backed up", "The console's bootloader (%s) is saved in\n%s"
-                         % (link.model.partitions_text, path))
+            widgets.tell(self.app, "Backed up", con.backup_text(path))
             self.load_backups()
         self.app.run_bg(lambda: con.backup_lk(link, root, cancel, self._prog_cb()), done, self._fail)
 
-    def _confirm_write(self, what, extra=""):
+    def _confirm_write(self, what, images_, extra="", tee_what=None):
+        """The one question before a write: it names every partition that gets written, and says so
+        when the secure firmware is written with the bootloader."""
         model = self.link.model
-        if len(model.partitions) > 1:
-            text = "Both bootloader slots (%s) of %s get %s.%s" % (model.partitions_text, self.link.label, what, extra)
+        lk, tee = lk_names(images_, model), tee_names(images_, model)
+        if len(lk) > 1:
+            text = "Both bootloader slots (%s) of %s get %s." % (names_text(lk), self.link.label, what)
         else:
-            text = "The bootloader (%s) of %s gets %s.%s" % (model.partitions_text, self.link.label, what, extra)
+            text = "The bootloader (%s) of %s gets %s." % (names_text(lk), self.link.label, what)
+        if tee:
+            text += " The secure firmware is written too: %s to %s." % (tee_what or "its secure firmware",
+                                                                       names_text(tee))
+        text += extra
         return widgets.ask(self.app, "Write %s to the console?" % what, text,
                            "Write it", kind="danger", notice=("danger", "A bootloader write", RISKS),
                            confirm_text="I understand the risks, the console is charged and stays connected")
 
-    def _write(self, images_, what):
-        """Back up first when this console has none here, then write and check."""
+    def _write(self, images_, what, tee_what=None, candidates=None):
+        """Back up first when this console has none here, then write and check. `candidates`
+        ({partition: [images it may hold now]}) spares a console that cannot send its data in one
+        piece from sending what the tool already has."""
         link = self.link
         root = self.backup_root()
         self.cancel = threading.Event()
         cancel = self.cancel
         self._busy(True, "Preparing...")
         prog = self._prog_cb()
+        if tee_what and not any(part in images_ for part in link.model.tee_partitions):
+            tee_what = None
 
         def work():
             mine = [b for b in con.list_backups(root) if b.get("ident") == link.ident]
             made = None
             if not mine:
                 self.app.post(self._progress, None, "No backup of this console yet: backing it up first...")
-                made = con.backup_lk(link, root, cancel, prog)
-            con.write_lk(link, images_, cancel, prog, verify=True)
-            return made
+                made = con.backup_lk(link, root, cancel, prog,
+                                     candidates=candidates or {p: [d] for p, d in images_.items()})
+            results = con.write_lk(link, images_, cancel, prog, verify=True)
+            return made, results
 
-        def done(made):
+        def done(res):
+            made, results = res
             self._busy(False)
             self.load_backups()
-            msg = "%s is on the console and was read back to check it." % what[:1].upper() + what[1:]
+            subject = "%s and %s are" % (what, tee_what) if tee_what else "%s is" % what
+            msg = "%s on the console." % (subject[:1].upper() + subject[1:])
+            lines = results_lines(results)
+            if lines:
+                msg += "\n\n" + "\n".join(lines)
             if made:
-                msg += "\n\nIts previous bootloader was backed up first, to\n%s" % made
+                msg += "\n\nBefore the first write a backup was made. %s" % con.backup_text(made)
             msg += "\n\nUnplug the console and hold Power to start it."
-            self.app.status("Done: %s written." % what)
+            self.app.status("Done: %s written." % (("%s and %s" % (what, tee_what)) if tee_what else what))
             widgets.tell(self.app, "Done", msg)
         self.app.run_bg(work, done, self._fail, name="write-lk")
 
@@ -460,7 +483,10 @@ class ConsolePage(Page):
         return ("latest", None) if r else None
 
     def _load_image(self, src, which, done):
-        """The image bytes and a label, read and checked off the window's thread, then done(...)."""
+        """The LK image, what it is, and the secure firmware image when the flash package has one
+        (1.2.0 and later; None otherwise), read and checked off the window's thread, then
+        done(data, info, tee, candidates): candidates is {partition: [the package's images for
+        it]}, for the backup made before a first write."""
         self._busy(True, "Getting the bootloader image...")
         cancel = threading.Event()
         self.cancel = cancel
@@ -480,17 +506,29 @@ class ConsolePage(Page):
                 if which not in imgs:
                     raise flashpkg.FlashPackageError("This flash package has no %s bootloader." % which)
                 data = imgs[which]
+                tee = imgs.get("tee_" + which)
+                lk_all = [imgs[k] for k in ("gammaos", "stock") if k in imgs]
+                tee_all = [imgs[k] for k in ("tee_gammaos", "tee_stock") if k in imgs]
+                cands = {part: lk_all for part in model.partitions}
+                cands.update({part: tee_all for part in model.tee_partitions if tee_all})
             else:
                 with open(path, "rb") as f:
                     data = f.read()
+                tee = None
+                cands = {part: [data] for part in model.partitions}
             info = con.check_lk_image(data, model)
-            return data, info
+            tee_problems = con.check_tee_image(tee).problems if tee is not None else []
+            return data, info, tee, tee_problems, cands
 
         def ok(r):
             self._busy(False)
-            data, info = r
+            data, info, tee, tee_problems, cands = r
             if info.problems:
                 widgets.tell(self.app, "This image is refused", "\n".join(info.problems), "danger")
+                return
+            if tee_problems:
+                widgets.tell(self.app, "The secure firmware in this package is refused",
+                             "Nothing was written.\n" + "\n".join(tee_problems), "danger")
                 return
             if which == "stock" and info.kind != "stock":
                 widgets.tell(self.app, "Not the stock bootloader", "The image is %s, not the stock bootloader."
@@ -501,7 +539,7 @@ class ConsolePage(Page):
                                    "This image is reported as %s, not GammaOS Pico. Write it anyway?" % info.kind,
                                    "Continue", kind="danger"):
                     return
-            done(data, info)
+            done(data, info, tee, cands)
         self.app.run_bg(work, ok, self._fail)
 
     def do_install(self):
@@ -511,11 +549,20 @@ class ConsolePage(Page):
         if not src:
             return
 
-        def go(data, info):
-            what = "GammaOS Pico %s" % (info.version or "")
-            if self._confirm_write(what.strip()):
-                self._write({part: data for part in self.link.model.partitions}, what.strip())
+        def go(data, info, tee, cands):
+            what = ("GammaOS Pico %s" % (info.version or "")).strip()
+            imgs = self._images(data, tee)
+            if self._confirm_write(what, imgs, tee_what="its secure firmware"):
+                self._write(imgs, what, "its secure firmware", cands)
         self._load_image(src, "gammaos", go)
+
+    def _images(self, data, tee):
+        """{partition: image}: the LK for both slots, and the secure firmware for both when given."""
+        model = self.link.model
+        imgs = {part: data for part in model.partitions}
+        if tee is not None:
+            imgs.update({part: tee for part in model.tee_partitions})
+        return imgs
 
     def do_stock(self):
         if not self.link:
@@ -524,9 +571,12 @@ class ConsolePage(Page):
         if not src:
             return
 
-        def go(data, info):
-            if self._confirm_write("the stock bootloader", " GammaOS Pico then no longer starts, whatever is on the card."):
-                self._write({part: data for part in self.link.model.partitions}, "the stock bootloader")
+        def go(data, info, tee, cands):
+            imgs = self._images(data, tee)
+            if self._confirm_write("the stock bootloader", imgs,
+                                   " GammaOS Pico then no longer starts, whatever is on the card.",
+                                   tee_what="the stock secure firmware"):
+                self._write(imgs, "the stock bootloader", "the stock secure firmware", cands)
         self._load_image(src, "stock", go)
 
     def do_restore(self):
@@ -566,26 +616,30 @@ class ConsolePage(Page):
             widgets.tell(self.app, "This backup cannot be used", str(e), "danger")
             return
         for part in sorted(imgs):
-            info = con.check_lk_image(imgs[part], model)
-            if info.problems:
-                widgets.tell(self.app, "This backup is refused", "%s: %s" % (part, "; ".join(info.problems)), "danger")
+            if part in model.tee_partitions:
+                problems = con.check_tee_image(imgs[part]).problems
+            else:
+                problems = con.check_lk_image(imgs[part], model).problems
+            if problems:
+                widgets.tell(self.app, "This backup is refused", "%s: %s" % (part, "; ".join(problems)), "danger")
                 return
         extra = ""
         if b.get("ident") != self.link.ident:
             extra = " This backup was made from another console (%s)." % b.get("ident")
-        if self._confirm_write("the backup from %s" % b.get("date"), extra):
-            self._write(imgs, "the backup from %s" % b.get("date"))
+        if self._confirm_write("the backup from %s" % b.get("date"), imgs, extra, tee_what="its secure firmware"):
+            self._write(imgs, "the backup from %s" % b.get("date"), "its secure firmware")
 
 
 def first_install_text(model):
     """How GammaOS Pico goes on a console with its stock bootloader the first time."""
-    copies = "only lk_a and lk_b" if len(model.partitions) > 1 else "only lk_a"
     return ("A %s with its stock bootloader has no fastboot this tool can use. The first time, GammaOS Pico "
             "goes on with SP Flash Tool v5 (V6 does not work), which the release has with MediaTek's USB driver "
-            "in %s: load %s from the flash package's spflash/gammaos/ (%s), choose Download Only with %s "
-            "ticked, then connect the powered-off console. The Installing page shows every step. From then "
-            "on, this tab backs the bootloader up, updates it and puts the stock one back."
-            % (model.name, model.windows_tools, model.scatter, model.flash_package, copies))
+            "in %s: load %s from the flash package's spflash/gammaos/ (%s), choose Download Only with only %s "
+            "ticked (a package older than 1.2.0 has no tee entries), then connect the powered-off console. The "
+            "Installing page shows every step. From then on, this tab backs the bootloader up, updates it and "
+            "puts the stock one back."
+            % (model.name, model.windows_tools, model.scatter, model.flash_package,
+               names_text(model.all_partitions)))
 
 
 def _backup_model(entry):

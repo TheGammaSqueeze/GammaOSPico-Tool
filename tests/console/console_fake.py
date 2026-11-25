@@ -4,12 +4,23 @@ It models USB bulk transfers at the packet level (512 byte packets, no zero leng
 data stream), so a host that reads past the data would swallow the OKAY, exactly like real USB.
 Faults can be switched on per test: FAIL replies, silence (timeouts), unplugging, corrupt read
 backs, a busy or driverless device, and an old LK without `oem part-read`.
+
+The secure firmware copies (tee_a, tee_b) can be written by every LK, but read back only by GammaOS
+Pico 1.2.0 and later: FakeConsole(version="1.1.2 ...") refuses `oem part-read:tee_a` the way a 1.1
+LK does ("only lk_a and lk_b"), FakeConsole(version="1.2.0 ...") allows it.
+
+The Pocket Block's LK has no `upload` since GammaOS Pico 1.1.0: FakeConsole(console="block",
+version="1.1.0 ..." or later) answers it with FAIL "no upload on this console: oem stage-hex /
+stage-crc" and offers `oem stage-crc` and `oem stage-hex` on what part-read staged, as the real one
+does. A Pocket Block fake of 1.0.x, and every Pocket Advance fake, keeps `upload`. `upload=` forces
+either.
 """
 
 from __future__ import annotations
 
 import re
 import struct
+import zlib
 from collections import deque
 from typing import Dict, List, Optional, Set
 
@@ -90,14 +101,49 @@ def make_lk_image(kind: str = "pico", version: Optional[str] = "1.0.0 abc1234", 
     return bytes(out)
 
 
+def make_tee_image(kind: str = "gammaos", seed: int = 1, filler: int = 4096, pad_to: Optional[int] = None,
+                   first: str = "atf") -> bytes:
+    """A small secure firmware image with the part chain of a real one: atf, cert1, cert2."""
+    body = bytes((seed * 11 + i) & 0xFF for i in range(filler))
+    body += b"\x00patched for the other cores\x00" if kind == "gammaos" else b"\x00as from the factory\x00"
+    parts = [(first, body, 0), ("cert1", b"\x11" * 0x6AD, 0x2000000), ("cert2", b"\x22" * 0x3D6, 0x2000002)]
+    out = bytearray()
+    for i, (name, data, itype) in enumerate(parts):
+        out += _header(name, len(data), i == len(parts) - 1, itype)
+        out += data
+        if i != len(parts) - 1:
+            _align(out)
+    if pad_to:
+        out += bytes(pad_to - len(out))
+    return bytes(out)
+
+
+def _at_least(version: Optional[str], floor) -> bool:
+    try:
+        major, minor = (version or "").split(" ")[0].split(".")[:2]
+        return (int(major), int(minor)) >= floor
+    except ValueError:
+        return False
+
+
+def _reads_tee(version: Optional[str]) -> bool:
+    """GammaOS Pico 1.2.0 and later read the secure firmware back."""
+    return _at_least(version, (1, 2))
+
+
+NO_UPLOAD = "no upload on this console: oem stage-hex / stage-crc"
+
+
 # ---- the device ----
 
 class FakeConsole:
     def __init__(self, serial: str = "N7KBVK6D99ZD6HPB", product: Optional[str] = None,
                  version: Optional[str] = "1.0.0 abc1234", part_read: bool = True,
-                 current_slot: str = "a", partition_size: int = 0x200000, console: str = "kpa"):
+                 current_slot: str = "a", partition_size: int = 0x200000, console: str = "kpa",
+                 tee_read: Optional[bool] = None, tee_size: int = 0x500000, upload: Optional[bool] = None):
         """console="block" is a Konkr Pocket Block: product k68v1_64_block, its own LK images. It has
-        lk_b too (the factory never writes it), so the tests can see that the tool leaves it alone."""
+        lk_b too. `tee_read` says whether part-read accepts tee_a and tee_b; left as None it
+        follows the version (1.2.0 and later do)."""
         if product is None:
             product = CONSOLE_STRINGS[console][1].decode("ascii")
         self.console = console
@@ -108,14 +154,23 @@ class FakeConsole:
             "max-download-size": "0x8000000",
             "partition-size:lk_a": "%x" % partition_size,
             "partition-size:lk_b": "%x" % partition_size,
+            "partition-size:tee_a": "%x" % tee_size,
+            "partition-size:tee_b": "%x" % tee_size,
             "version": "0.5",
         }
         if version is not None:
             self.vars["version-gammaos-pico"] = version
         self.part_read = part_read
+        self.tee_read = _reads_tee(version) if tee_read is None else tee_read
+        # the Pocket Block's USB cannot carry an upload: its LK refuses it from 1.1.0 on
+        self.upload = not (console == "block" and _at_least(version, (1, 1))) if upload is None else upload
+        self.hex_bytes = 0               # bytes sent by stage-hex, the slow way
+        self.corrupt_hex = 0             # stage-hex answers left that carry a damaged byte
         self.partitions: Dict[str, bytearray] = {
             "lk_a": bytearray(make_lk_image(seed=1, pad_to=partition_size, console=console)),
             "lk_b": bytearray(make_lk_image(seed=1, pad_to=partition_size, console=console)),
+            "tee_a": bytearray(make_tee_image("stock", seed=1, pad_to=tee_size)),
+            "tee_b": bytearray(make_tee_image("stock", seed=1, pad_to=tee_size)),
         }
         self.download: Optional[bytes] = None
         self.staged = b""
@@ -220,7 +275,14 @@ class FakeConsole:
             self._reply("OKAY")
         elif cmd.startswith("oem part-read:") and self.part_read:
             self._part_read(cmd[len("oem part-read:"):])
+        elif cmd.startswith("oem stage-crc") and not self.upload:
+            self._stage_crc(cmd[len("oem stage-crc"):])
+        elif cmd.startswith("oem stage-hex:") and not self.upload:
+            self._stage_hex(cmd[len("oem stage-hex:"):])
         elif cmd == "upload":
+            if not self.upload:
+                self._reply("FAIL", NO_UPLOAD)
+                return
             if not self.staged:
                 self._reply("FAIL", "nothing staged (oem shotstage first)")
                 return
@@ -234,10 +296,36 @@ class FakeConsole:
         else:
             self._reply("FAIL", "unknown command")
 
+    def _stage_crc(self, arg: str) -> None:
+        """CRC-32 of each CHUNK bytes of the staged data, six 8 digit words to an INFO line."""
+        chunk = int(arg.lstrip(":") or "0", 16) or 0x1000
+        words = ["%08x " % zlib.crc32(self.staged[i:i + chunk]) for i in range(0, len(self.staged), chunk)]
+        for i in range(0, len(words), 6):
+            self._reply("INFO", "".join(words[i:i + 6]))
+        self._reply("OKAY")
+
+    def _stage_hex(self, arg: str) -> None:
+        """The staged bytes from OFF, LEN of them, 24 to an INFO line after "%06x:"."""
+        off_text, _, len_text = arg.partition(":")
+        off = min(int(off_text, 16), len(self.staged))
+        n = min(int(len_text, 16), len(self.staged) - off)
+        data = bytearray(self.staged[off:off + n])
+        if self.corrupt_hex and data:
+            data[0] ^= 0x5A
+            self.corrupt_hex -= 1
+        self.hex_bytes += n
+        for i in range(0, n, 24):
+            self._reply("INFO", "%06x:" % (off + i) + bytes(data[i:i + 24]).hex())
+        self._reply("OKAY")
+
     def _part_read(self, arg: str) -> None:
         name, _, off_text = arg.partition(":")
-        if name not in ("lk_a", "lk_b"):
+        if name in ("tee_a", "tee_b") and not self.tee_read:
             self._reply("FAIL", "part-read: only lk_a and lk_b")
+            return
+        if name not in ("lk_a", "lk_b", "tee_a", "tee_b"):
+            self._reply("FAIL", "part-read: only lk_a, lk_b, tee_a and tee_b" if self.tee_read
+                        else "part-read: only lk_a and lk_b")
             return
         off = 0
         if off_text:
